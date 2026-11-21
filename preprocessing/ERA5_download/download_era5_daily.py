@@ -66,12 +66,14 @@ def prepare_netcdf(path, out_dir, year, variable):
     inspect_files(out_dir.glob(f"{variable}_*.nc"), year, [variable])
 
 
-def plan_jobs(root, start, end, no_extract=False):
+def plan_jobs(root, start, end, no_extract=False, only_variable=None):
     jobs = []
     for year in range(start, end + 1):
         for group, variables in GROUP_VARIABLES.items():
             folder = root / "netcdf" / group / str(year)
             for variable in variables:
+                if only_variable is not None and variable != only_variable:
+                    continue
                 stem = root / "downloads" / group / f"ERA5_daily_{group}_{variable}_{year}"
                 if valid_netcdf(folder.glob(f"{variable}_*.nc"), year, variable):
                     print(f"[SKIP] {year} {variable}: complete NetCDF")
@@ -90,6 +92,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--start-year", type=int, default=1979)
     parser.add_argument("--end-year", type=int, default=2025)
+    parser.add_argument("--variable", choices=CDS_VARIABLES, help="Download only this variable")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_ROOT)
     parser.add_argument("--no-extract", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
@@ -97,7 +100,8 @@ def main(argv=None):
     if args.start_year > args.end_year:
         parser.error("Require start-year <= end-year")
 
-    jobs = plan_jobs(args.output_dir, args.start_year, args.end_year, args.no_extract)
+    jobs = plan_jobs(args.output_dir, args.start_year, args.end_year,
+                     args.no_extract, args.variable)
     print(f"Dataset: {DATASET}; global 0.25°; UTC+00:00; 1_hourly")
     print(f"Sequential tasks: {len(jobs)}; output: {args.output_dir}")
     if args.dry_run:

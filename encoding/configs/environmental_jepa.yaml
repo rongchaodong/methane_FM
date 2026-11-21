@@ -1,0 +1,82 @@
+# Run from the repository root. Paths refer to native data files.
+# Normalization constants are initial scales in the units stored on disk.
+registry:
+  sources:
+    - name: era5_daily
+      frequency: daily
+      resolution: [0.25, 0.25]
+      coordinates: [latitude, longitude, time]
+      drivers:
+        TAIR: {path: "ERA5_daily/processed/daily_ERA5_TAIR_{year}.nc", normalization: [15, 15], units: degree_Celsius}
+        VAPR: {path: "ERA5_daily/processed/daily_ERA5_VAPR_{year}.nc", normalization: [12, 10], units: hPa}
+        PREC: {path: "ERA5_daily/processed/daily_ERA5_PREC_{year}.nc", normalization: [3, 8], units: mm/day}
+        SOLR: {path: "ERA5_daily/processed/daily_ERA5_SOLR_{year}.nc", normalization: [180, 100], units: "W m-2"}
+        SM: {path: "ERA5_daily/processed/daily_ERA5_soil_{year}.nc", normalization: [0.25, 0.15], units: "m3 m-3"}
+    - name: soil_5km
+      frequency: static
+      format: geotiff
+      resolution: [5000, 5000]
+      coordinates: []
+      drivers:
+        Bd: {path: Drivers/bdod_0-5cm_mean_5000.tif, normalization: [115, 30], units: cg/cm3}
+        Clay: {path: Drivers/clay_0-5cm_mean_5000.tif, normalization: [230, 100], units: g/kg}
+        Ph: {path: Drivers/phh2o_0-5cm_mean_5000.tif, normalization: [62, 12], units: "pH*10"}
+        SOC: {path: Drivers/soc_0-5cm_mean_5000.tif, normalization: [500, 650], units: dg/kg}
+        Sand: {path: Drivers/sand_0-5cm_mean_5000.tif, normalization: [440, 180], units: g/kg}
+        Silt: {path: Drivers/silt_0-5cm_mean_5000.tif, normalization: [280, 120], units: g/kg}
+    - name: land_05
+      frequency: static
+      resolution: [0.5, 0.5]
+      coordinates: [lat, lon]
+      drivers:
+        clelev: {path: Drivers/clelev.nc, normalization: [500, 1000]}
+        climatetype: {path: Drivers/climatetype.nc, categories: 4}
+        cltveg: {path: Drivers/cltveg.nc, categories: 36}
+        vegetation_type_11: {path: Drivers/vegetation_type_11.nc, categories: 13}
+    - name: global_concentrations
+      frequency: annual
+      resolution: [180, 360]
+      coordinates: []
+      drivers:
+        CH4_concentration: {path: Drivers/ch4-1979-2025.txt, normalization: [0.08, 0.01]}
+        CO2_concentration: {path: Drivers/co2-1979-2025.txt, normalization: [390, 35]}
+sampling:
+  history_days: 14
+  spatial_selection: centers
+  max_tokens: 4096
+queries:
+  start_time: "2018-01-01"
+  end_time: "2021-01-01"
+  stride_days: 14
+  locations:
+    - {lat: 40.5, lon: -74.5}
+    - {lat: 49.75, lon: 11.25, delta_lat: 0.5, delta_lon: 1.0}
+    - {lat: -3.25, lon: -60.25, delta_lat: 1.0, delta_lon: 1.0}
+    - {lat: -1.25, lon: 36.75, delta_lat: 1.0, delta_lon: 1.0}
+dataset:
+  validation_fraction: 0.2
+  future_targets:
+    - {horizon_days: 1, period: day}
+    - {horizon_days: 7, period: day, spatial_support: [0.5, 1.0]}
+    - {horizon_days: 1, period: month, spatial_support: [1.0, 1.0]}
+model:
+  hidden_dim: 128
+  latent_dim: 128
+  attention_heads: 4
+  cross_attention_layers: 1
+  dropout: 0.2
+jepa:
+  ema_momentum: 0.996
+  variance_weight: 0.1
+training:
+  epochs: 4
+  batch_size: 4
+  optimizer: adamw
+  learning_rate: 0.0003
+  seed: 42
+  device: cuda
+  cpu_threads: 2
+  gradient_clip: 1.0
+  mixed_precision: false
+  log_every_steps: 20
+  output_dir: encoding/model_save/environmental_jepa

@@ -1,0 +1,5 @@
+torch>=2.3
+numpy>=1.24
+PyYAML>=6
+netCDF4>=1.6
+rasterio>=1.3
