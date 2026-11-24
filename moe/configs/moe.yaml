@@ -1,4 +1,4 @@
-# 从仓库根目录启动。默认配置需先核对数据来源、质量规则和增长阈值。
+# Run from the repository root.
 encoder:
   checkpoint: auto
   expected_best_epoch: 4
@@ -13,18 +13,23 @@ data:
   embedding_mode: online
   gather_mode: history
   cache_path: null
-  validation_fraction: 0.2
+  split_seed: 42
+  split_manifest_dir: moe/runs/splits-v2
+  simulation_mode: full
+  simulation_split_mode: temporal
+  simulation_date_range: ['1979-01-01', '9999-01-01']
+  simulation_tile_mib: 16
+  simulation_daily_start: '1979-01-01'
   simulation_spatial_block_degrees: 5
-  samples_per_simulation_source: {train: 12000, validation: 3000}
-  simulation_date_range: ['1980-01-01', '2021-01-01']
+  observation_split_mode: temporal
+  observation_short_sites: train_only
   observation_date_range: ['1980-01-01', '2026-01-01']
   adapters:
-    # 当前文件缺少单位，按来源文档核实后填写。
-    tem_emission: {input_unit: null}
+    tem_emission: {input_unit: mg_ch4_m2_day}
     tem_uptake: {}
     memo_uptake: {}
     fluxnet: {input_unit: nmol_ch4_m2_s, period: day, site_classes: [WET]}
-    chamber: {input_unit: null, period: day}
+    chamber: {input_unit: mg_ch4_m2_day, period: month, nonpositive_uptake: false}
 
 moe:
   initial_num_experts: 4
@@ -45,7 +50,7 @@ moe:
 training:
   common:
     device: cuda
-    seed: 42
+    training_seed: 42
     batch_size: 8
     num_workers: 0
     epochs: 10
@@ -70,10 +75,11 @@ training:
   pretrain:
     sources: [TEM, MeMo]
     source_weights: {TEM: 1.0, MeMo: 1.0}
+    checkpoint_interval_steps: 10000
   finetune:
     sources: [FLUXNET, Chamber]
     source_weights: {FLUXNET: 1.0, Chamber: 1.0}
-    # 训练前可按独立站点或日期保留后续增长批次。
+    # Scope the initial observations before creating the manifest if reserving future data.
     data: {}
     fluxnet_target_type: emission
     use_simulation_replay: true
@@ -90,8 +96,8 @@ training:
   continual:
     sources: [FLUXNET, Chamber]
     source_weights: {FLUXNET: 1.0, Chamber: 1.0}
-    # 通过 observation_site_ids 或 observation_date_range 指定独立批次。
-    data: {}
+    # Set a unique ID and select new observations using dates, sites, or updated input files.
+    data: {observation_cohort: null}
     candidate_training: true
     function_preserving_split: true
     validate_before_accept: true
@@ -103,7 +109,7 @@ training:
     replay_weight: 0.25
     distillation_weight: 0.1
     growth:
-      # 阈值应由实际验证集校准。保留 null 时只记录诊断。
+      # Use validation data to calibrate thresholds. Null enables monitoring only.
       distance_threshold: null
       loss_threshold: null
       min_samples: 32

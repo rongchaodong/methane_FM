@@ -28,7 +28,7 @@ class MultiResolutionGatherer:
         if set(registry.sources) - set(sources):
             raise ValueError("A data source implementation is required for each registered source")
 
-    def gather(self, query, *, start_time=None, end_time=None, include_static=True):
+    def gather(self, query, *, start_time=None, end_time=None, include_static=True, daily_start=None):
         """Default to history ending at query.start_time; targets pass an explicit window.
 
         Global annual tables are slow context covariates. Like static grids, they are
@@ -38,13 +38,17 @@ class MultiResolutionGatherer:
         end = as_datetime(end_time) if end_time is not None else query.start_time
         if end <= start:
             raise ValueError("Gather requires start_time < end_time")
+        daily_start = as_datetime(daily_start) if daily_start is not None else None
         blocks, count = [], 0
         for name, source in self.sources.items():
             spec = self.registry.sources[name]
             global_annual = spec.frequency == "annual" and not spec.coordinates
             if not include_static and (spec.frequency == "static" or global_annual):
                 continue
-            block = source.read_window(query, start, end, self.spatial_selection,
+            source_start = max(start, daily_start) if daily_start is not None and spec.frequency == "daily" else start
+            if source_start >= end:
+                continue
+            block = source.read_window(query, source_start, end, self.spatial_selection,
                                        max_tokens=self.max_tokens - count)
             if spec.frequency != "static" and len(block):
                 start_day, end_day = ((value - EPOCH).total_seconds() / 86400 for value in (start, end))

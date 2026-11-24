@@ -38,4 +38,4 @@ python -m encoding.train_environmental_jepa --config encoding/configs/environmen
 
 ## 甲烷响应专家（Continual MoE）
 
-[moe/](moe/README.md) 复用环境 Encoder，在同一模型中预测自然排放与土壤吸收。训练流程包括 TEM / MeMo 预训练、FLUXNET / Chamber 微调，以及用新观测验证候选专家。数据字段、单位确认、各阶段启动和恢复命令见 [MoE 说明](moe/README.md)。目前已实现训练入口，真实数据训练由项目维护者启动。
+[moe/](moe/README.md) 复用环境 Encoder，预测自然排放与 upland 土壤甲烷净交换。TEM 日排放有 40 个年度文件，覆盖 1979–2018。正式预训练按块读取 1979 年起的全球有效 TEM / MeMo 标签，各产品末段年份用于验证。FLUXNET / Chamber 默认在各站内部做时间划分。用 `python -m moe.train --config moe/configs/moe.yaml --stage pretrain --prepare-data` 生成或核验模拟清单，初始观测将 `--stage` 改为 `finetune`。数据版本、坐标校正、Replay 和小规模配置见 [MoE 说明](moe/README.md)。

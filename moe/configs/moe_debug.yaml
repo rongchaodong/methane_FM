@@ -1,0 +1,30 @@
+# Run from the repository root. This configuration deliberately restricts simulation coverage.
+encoder:
+  checkpoint: auto
+  expected_best_epoch: 4
+  spatial_selection: intersects
+  freeze: true
+
+data:
+  split_seed: 42
+  split_manifest_dir: moe/runs/splits-debug-v2
+  simulation_mode: debug
+  simulation_split_mode: temporal
+  simulation_date_range: ['1999-01-01', '2004-01-01']
+  samples_per_simulation_source: {train: 64, validation: 32}
+  observation_split_mode: temporal
+  observation_short_sites: train_only
+
+training:
+  common:
+    device: cpu
+    cpu_threads: 2
+    training_seed: 42
+    batch_size: 8
+    num_workers: 0
+    epochs: 1
+    output_dir: moe/runs/debug
+  pretrain:
+    sources: [TEM, MeMo]
+  finetune:
+    sources: [FLUXNET, Chamber]

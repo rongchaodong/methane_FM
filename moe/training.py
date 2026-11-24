@@ -27,6 +27,7 @@ from .model import (
     supervision,
     task_mask,
 )
+from .splits import audit_summary, loader_partitions, stage_manifests
 
 
 def _device_and_amp(options):
@@ -98,6 +99,17 @@ class EpochMetrics:
         self.weighted_objective = 0.0
         self.weighted_auxiliary = defaultdict(float)
         self.objective_steps = 0
+
+    def state_dict(self):
+        return {"groups": dict(self.groups), "routing_mass": self.routing_mass, "routing_entropy": self.routing_entropy,
+                "routing_weight": self.routing_weight, "weighted_objective": self.weighted_objective,
+                "weighted_auxiliary": dict(self.weighted_auxiliary), "objective_steps": self.objective_steps}
+
+    def load_state_dict(self, state):
+        self.groups.update(state["groups"])
+        self.weighted_auxiliary.update(state["weighted_auxiliary"])
+        for name in ("routing_mass", "routing_entropy", "routing_weight", "weighted_objective", "objective_steps"):
+            setattr(self, name, state[name])
 
     @torch.no_grad()
     def update(self, output, batch, criterion, objective, auxiliary=None):
@@ -269,6 +281,7 @@ def run_epoch(
     model, encoder, criterion, loader, device, amp_dtype, *,
     optimizer=None, scaler=None, options=None, replay_loader=None,
     teacher=None, anchors=None, candidate=None, max_steps=None, require_samples=True,
+    stats=None, on_step=None,
 ):
     options = options or {}
     training = optimizer is not None
@@ -278,7 +291,8 @@ def run_epoch(
         model.train(training)
     encoder.train(training and candidate is None)
     criterion.train(training and candidate is None)
-    stats = EpochMetrics(criterion.source_weights)
+    if stats is None:
+        stats = EpochMetrics(criterion.source_weights)
     replay_weight = options.get("replay_weight", 0.0)
     distillation_weight = options.get("distillation_weight", 0.0)
     physical_weight = options.get("physical_response_weight", 0.0) if training else 0.0
@@ -286,6 +300,8 @@ def run_epoch(
     steps = 0
     for raw_batch in loader:
         if not _usable(raw_batch):
+            if on_step is not None:
+                raise RuntimeError("A full simulation batch lost valid indexed supervision.")
             continue
         batch = to_device(raw_batch, device)
         if training:
@@ -339,6 +355,8 @@ def run_epoch(
                         anchors.update(output["latent"], batch)
         stats.update(output, batch, criterion, objective, auxiliary)
         steps += 1
+        if on_step is not None:
+            on_step(steps, stats)
         if max_steps is not None and steps >= max_steps:
             break
     metrics = stats.result(model.num_experts)
@@ -350,6 +368,8 @@ def run_epoch(
 def _loader_seed(loader, seed):
     if loader is not None and loader.generator is not None:
         loader.generator.manual_seed(seed)
+        if hasattr(loader.batch_sampler, "set_progress"):
+            loader.batch_sampler.set_progress(seed)
 
 
 def _export_metrics(output, history):
@@ -433,8 +453,52 @@ def _fit(
     train, validation = loaders
     best = output / (f"best-{phase}.pt" if phase else "best.pt")
     replay_train = replay[0] if replay is not None else None
-    seed = options.get("seed", 42)
+    seed = options["training_seed"]
     patience = int(options.get("patience", 0))
+    streaming = train.dataset.streaming
+    checkpoint_interval = int(options.get("checkpoint_interval_steps", 10000))
+    if streaming and checkpoint_interval < 1:
+        raise ValueError("checkpoint_interval_steps must be positive for full simulation.")
+
+    def persist_progress():
+        save_checkpoint(output / "last.pt", model, encoder, config, stage=stage, phase=phase,
+                        criterion=criterion, optimizer=optimizer, scheduler=scheduler, scaler=scaler,
+                        progress=_checkpoint_progress(progress), teacher=_teacher_state(teacher))
+
+    def scan(loader, split, epoch, *, anchors=None, **kwargs):
+        saved = progress.get("data_scan")
+        sampler = loader.batch_sampler
+        offset = 0
+        metrics = EpochMetrics(criterion.source_weights)
+        if saved is not None and saved["split"] == split:
+            offset = saved["batches"]
+            metrics.load_state_dict(saved["metrics"])
+            torch.set_rng_state(saved["torch_rng"])
+            if device.type == "cuda":
+                torch.cuda.set_rng_state(saved["cuda_rng"], device)
+            if anchors is not None:
+                anchors.selected = saved["anchor_samples"]
+                anchors.generator.set_state(saved["anchor_rng"])
+        sampler.set_progress(seed + epoch, offset)
+
+        def checkpoint_step(steps, stats):
+            batches = offset + steps
+            if batches % checkpoint_interval:
+                return
+            progress["data_scan"] = {"split": split, "batches": batches, "metrics": stats.state_dict(),
+                                     "torch_rng": torch.get_rng_state()}
+            if device.type == "cuda":
+                progress["data_scan"]["cuda_rng"] = torch.cuda.get_rng_state(device)
+            if anchors is not None:
+                progress["data_scan"].update(anchor_samples=anchors.selected, anchor_rng=anchors.generator.get_state())
+            persist_progress()
+            print(json.dumps({"stage": stage, "event": "data_progress", "epoch": epoch + 1,
+                              "split": split, "batches": batches, "total_batches": sampler.total_batches,
+                              "checkpoint": str(output / "last.pt")}), flush=True)
+
+        return run_epoch(model, encoder, criterion, loader, device, amp_dtype, stats=metrics,
+                         on_step=checkpoint_step, anchors=anchors, **kwargs)
+
     for epoch in range(int(progress["epoch"]), epochs):
         if progress["phase_completed"]:
             break
@@ -446,12 +510,24 @@ def _fit(
             AnchorReservoir(count, seed, getattr(train.dataset, "provenance", {}), encoder.provenance)
             if count > 0 and epoch == 0 and stage == "pretrain" else None
         )
-        train_metrics = run_epoch(model, encoder, criterion, train, device, amp_dtype,
-                                  optimizer=optimizer, scaler=scaler, options=options,
-                                  replay_loader=replay_train, teacher=teacher, anchors=anchors)
-        if anchors is not None:
-            anchors.apply(model)
-        validation_metrics = run_epoch(model, encoder, criterion, validation, device, amp_dtype)
+        fit_options = dict(optimizer=optimizer, scaler=scaler, options=options,
+                           replay_loader=replay_train, teacher=teacher, anchors=anchors)
+        if streaming:
+            if "completed_train_pass" not in progress:
+                progress["completed_train_pass"] = scan(train, "train", epoch, **fit_options)
+                if anchors is not None:
+                    anchors.apply(model)
+                progress.pop("data_scan", None)
+                persist_progress()
+            train_metrics = progress["completed_train_pass"]
+            validation_metrics = scan(validation, "validation", epoch)
+            progress.pop("completed_train_pass")
+            progress.pop("data_scan", None)
+        else:
+            train_metrics = run_epoch(model, encoder, criterion, train, device, amp_dtype, **fit_options)
+            if anchors is not None:
+                anchors.apply(model)
+            validation_metrics = run_epoch(model, encoder, criterion, validation, device, amp_dtype)
         score = validation_metrics["data_loss"]
         progress["epoch"] = epoch + 1
         improved = progress["best_loss"] is None or score < progress["best_loss"] - options.get("min_delta", 0.0)
@@ -494,7 +570,7 @@ def _matching_window(pairs):
 
 def _continual(
     model, encoder, criterion, loaders, replay, config, options,
-    resume, previous, device, amp_dtype, output, history, provenance, historical_observations,
+    resume, previous, device, amp_dtype, output, history, provenance, cohort,
 ):
     candidate_training = options.get("candidate_training", True)
     if candidate_training and not all(options.get(key, True)
@@ -523,8 +599,6 @@ def _continual(
         growth.streak = 0
     progress["history"] = history
     progress["data_provenance"] = provenance
-    progress["historical_observations"] = historical_observations
-    cohort = len(historical_observations)
 
     def persist(path):
         save_checkpoint(path, model, encoder, config, stage="continual", criterion=criterion,
@@ -535,7 +609,7 @@ def _continual(
     candidate_steps = options.get("candidate_steps")
     if min(epochs, candidate_epochs) < 1 or (candidate_steps is not None and candidate_steps < 1):
         raise ValueError("Continual/candidate epochs and any candidate_steps must be positive")
-    seed = options.get("seed", 42)
+    seed = options["training_seed"]
     # 嵌套优化使用单独的 shuffle RNG，恢复扫描可以从相同顺序继续。
     candidate_loader = DataLoader(
         train.dataset, batch_size=train.batch_size, num_workers=train.num_workers,
@@ -651,10 +725,10 @@ def _continual(
     return {"checkpoint": str(output / "last.pt"), "experts": model.num_experts, "history": history}
 
 
-def _stage_loaders(data, sources, options, encoder, gatherer, stage):
-    return build_loaders(data, sources, batch_size=options.get("batch_size", 16),
-                         num_workers=options.get("num_workers", 0), seed=options.get("seed", 42),
-                         gatherer=gatherer, encoder_metadata=encoder.provenance, stage=stage)
+def _stage_loaders(data, partitions, options, encoder, gatherer):
+    return build_loaders(data, partitions, batch_size=options.get("batch_size", 16),
+                         num_workers=options.get("num_workers", 0), training_seed=options["training_seed"],
+                         gatherer=gatherer, encoder_metadata=encoder.provenance)
 
 
 def _phase_options(stage, options, encoder_options):
@@ -687,14 +761,15 @@ def _phase_options(stage, options, encoder_options):
     return phases
 
 
-def _load_best(path, source_checkpoint):
-    if path.exists():
-        return load_checkpoint(path)
-    if source_checkpoint:
-        original = Path(source_checkpoint).parent / path.name
-        if original.exists():
-            return load_checkpoint(original)
-    raise FileNotFoundError(f"Missing best validation checkpoint for phase transition or resume: {path}")
+def _load_best(path, source_checkpoint, provenance):
+    if not path.exists() and source_checkpoint:
+        path = Path(source_checkpoint).parent / path.name
+    if not path.exists():
+        raise FileNotFoundError(f"Missing best validation checkpoint for phase transition or resume: {path}")
+    payload = load_checkpoint(path)
+    if payload["progress"].get("data_provenance") != provenance:
+        raise ValueError(f"Best validation checkpoint uses different split provenance: {path}")
+    return payload
 
 
 def _data_options(base, overrides):
@@ -705,36 +780,12 @@ def _data_options(base, overrides):
     }}
 
 
-def _loader_provenance(loaders, replay):
-    names = ("train", "validation", "replay_train", "replay_validation")
-    return {name: loader.dataset.provenance
-            for name, loader in zip(names, (*loaders, *(replay or ())))}
-
-
-def _check_observation_overlap(new_splits, old_splits):
-    for new in new_splits:
-        for old in old_splits:
-            for product, new_sites in new.get("sites_by_product", {}).items():
-                shared = set(new_sites).intersection(old.get("sites_by_product", {}).get(product, ()))
-                if not shared:
-                    continue
-                current, previous = new["products"][product], old["products"][product]
-                if current["start"] < previous["end"] and previous["start"] < current["end"]:
-                    raise ValueError(
-                        f"Continual cohort overlaps historical {product} observations for sites "
-                        f"{', '.join(sorted(shared)[:5])}; configure disjoint observation sites or dates"
-                    )
-
-
-def run_training(config, stage, checkpoint=None, resume=None, output_dir=None):
+def run_training(config, stage, checkpoint=None, resume=None, output_dir=None, *, prepare_data=False):
     """Run an explicitly requested stage on configured real data."""
     if stage not in ("pretrain", "finetune", "continual"):
         raise ValueError(f"Unknown MoE training stage: {stage}")
     options = {**config.get("training", {}).get("common", {}), **config["training"][stage]}
-    device, amp_dtype = _device_and_amp(options)
-    if "cpu_threads" in options:
-        torch.set_num_threads(options["cpu_threads"])
-    seed_everything(options.get("seed", 42))
+    options.setdefault("training_seed", options.get("seed", 42))
     source_checkpoint = resume or checkpoint
     payload = load_checkpoint(source_checkpoint) if source_checkpoint else None
     prior_stages = {"pretrain": (), "finetune": ("pretrain",), "continual": ("finetune", "continual")}[stage]
@@ -744,9 +795,35 @@ def run_training(config, stage, checkpoint=None, resume=None, output_dir=None):
         if any(payload["config"].get(key) != config.get(key)
                for key in ("encoder", "data", "moe", "training")):
             raise ValueError("Resume requires the same encoder, data, model, and training configuration")
-    elif ((payload is None and prior_stages) or (payload is not None and payload["stage"] not in prior_stages)):
+    elif ((payload is None and prior_stages and not (prepare_data and stage == "finetune"))
+          or (payload is not None and payload["stage"] not in prior_stages)):
         raise ValueError(f"{stage} expects prior checkpoint stages {prior_stages}")
     encoder_options = config.get("encoder", {})
+    data = _data_options(config["data"], options.get("data", {}))
+    past_data = payload["progress"].get("data_provenance", {}) if payload else None
+    previous_fluxnet = (past_data or {}).get("train", {}).get("products", {}).get("fluxnet", {}).get("target_type")
+    data["fluxnet_target_type"] = options.get(
+        "fluxnet_target_type", data.get("fluxnet_target_type", previous_fluxnet or "emission")
+    )
+    phases = _phase_options(stage, options, encoder_options) if stage != "continual" else []
+    needs_replay = stage == "continual" or (
+        stage == "finetune" and options.get("use_simulation_replay", True)
+        and any(phase.get("replay_weight") or phase.get("distillation_weight") for name, phase in phases if name == "B")
+    )
+    replay_sources = options.get("replay_sources", ["TEM", "MeMo"]) if needs_replay and payload else []
+    replay_overrides = options.get("replay_data", {})
+    if replay_sources and replay_overrides.keys() - {"embedding_mode", "cache_path", "gather_mode"}:
+        raise ValueError("replay_data can only change the embedding mode, cache path, or gather mode.")
+    active, split_history, replay_names, intersections = stage_manifests(
+        data, options["sources"], stage, past_data, resume=bool(resume), replay_sources=replay_sources,
+    )
+    if prepare_data:
+        return audit_summary(active, intersections, int(options.get("batch_size", 16)))
+
+    device, amp_dtype = _device_and_amp(options)
+    if "cpu_threads" in options:
+        torch.set_num_threads(options["cpu_threads"])
+    seed_everything(options["training_seed"])
     expected_provenance = payload["encoder_provenance"] if payload else None
     encoder = load_environmental_encoder(encoder_options, expected_provenance=expected_provenance).to(device)
     if payload:
@@ -759,26 +836,14 @@ def run_training(config, stage, checkpoint=None, resume=None, output_dir=None):
     if model.latent_dim != encoder_options.get("latent_dim", 128):
         raise ValueError("MoE and encoder latent dimensions differ")
     encoder.set_trainable(())
-    data = _data_options(config["data"], options.get("data", {}))
-    past_data = payload["progress"].get("data_provenance", {}) if payload else {}
-    previous_fluxnet = past_data.get("train", {}).get("products", {}).get("fluxnet", {}).get("target_type")
-    data["fluxnet_target_type"] = options.get(
-        "fluxnet_target_type", data.get("fluxnet_target_type", previous_fluxnet or "emission")
-    )
     cached = data.get("embedding_mode", "online") == "cached"
     if cached and encoder.adapted:
         raise ValueError("Cached latents require the original, untuned JEPA encoder")
 
-    replay = None
-    phases = _phase_options(stage, options, encoder_options) if stage != "continual" else []
+    loaders, replay = (), None
     if any(phase.get("unfreeze_patterns") and cached for _, phase in phases):
         raise ValueError("Cached latents cannot be used in an encoder fine-tuning phase")
-    needs_replay = stage == "continual" or (
-        stage == "finetune" and options.get("use_simulation_replay", True)
-        and any(phase.get("replay_weight") or phase.get("distillation_weight") for name, phase in phases if name == "B")
-    )
-    replay_sources = options.get("replay_sources", ["TEM", "MeMo"]) if needs_replay else []
-    replay_data = _data_options(config["data"], options.get("replay_data", {}))
+    replay_data = {**config["data"], **replay_overrides}
     replay_cached = replay_data.get("embedding_mode", data.get("embedding_mode", "online")) == "cached"
     if replay_sources and replay_cached and (
         encoder.adapted or any(phase.get("unfreeze_patterns") for _, phase in phases)
@@ -797,27 +862,27 @@ def run_training(config, stage, checkpoint=None, resume=None, output_dir=None):
     calibration.update(options.get("calibration_sources", ()))
     options["calibration_sources"] = sorted(calibration)
     try:
-        loaders = _stage_loaders(data, options["sources"], options, encoder, None if cached else gatherer, stage)
-        if replay_sources:
-            replay = _stage_loaders(replay_data, replay_sources, options, encoder,
-                                    None if replay_cached else gatherer, "pretrain")
-        provenance = _loader_provenance(loaders, replay)
+        loaders = _stage_loaders(data, loader_partitions([active]), options, encoder, None if cached else gatherer)
+        if replay_names:
+            replay = _stage_loaders(replay_data, loader_partitions(split_history, replay_names), options,
+                                    encoder, None if replay_cached else gatherer)
+        provenance = {"active_manifest": active[0], "historical_manifests": [ref for ref, _ in split_history],
+                      "intersections": intersections, "train": loaders[0].dataset.provenance,
+                      "validation": loaders[1].dataset.provenance}
+        if replay:
+            provenance.update(replay_train=replay[0].dataset.provenance, replay_validation=replay[1].dataset.provenance)
         if resume and provenance != past_data:
             raise ValueError("Training data provenance changed since the checkpoint was saved")
         if stage == "continual":
             criterion = _make_criterion(options, device, inherited_criterion)
-            historical_observations = list(payload["progress"].get("historical_observations", []))
-            if not resume:
-                if not past_data:
-                    raise ValueError("Continual growth requires historical observation provenance in the checkpoint")
-                historical_observations.append(past_data)
-            new_splits = (provenance["train"], provenance["validation"])
-            old_splits = [prior[name] for prior in historical_observations for name in ("train", "validation")]
-            old_splits += [data for name, data in provenance.items() if name.startswith("replay_")]
-            _check_observation_overlap(new_splits, old_splits)
+            cohort = sum(manifest["settings"]["kind"] != "simulation" for _, manifest in split_history)
             return _continual(model, encoder, criterion, loaders, replay, config, options,
                               payload if resume else None, previous_continual, device, amp_dtype,
-                              output, history, provenance, historical_observations)
+                              output, history, provenance, cohort)
+        for loader in loaders:
+            if not all(product["valid_labels"] for product in loader.dataset.provenance["products"].values()):
+                split = loader.dataset.provenance["split"]
+                raise ValueError(f"Every active product requires valid labels in the {split} partition.")
         resume_phase = payload["phase"] if resume else phases[0][0]
         available_phases = [phase for phase, _ in phases]
         if resume_phase not in available_phases:
@@ -840,12 +905,14 @@ def run_training(config, stage, checkpoint=None, resume=None, output_dir=None):
             best, _ = _fit(model, encoder, criterion, loaders, replay, config, phase_options, stage,
                            phase, current_resume, teacher, device, amp_dtype, output, history, provenance)
             if position < len(phases) - 1:
-                previous_best = _load_best(best, source_checkpoint)
+                previous_best = _load_best(best, source_checkpoint, provenance)
                 model = restore_model(previous_best).to(device)
                 restore_encoder(encoder, previous_best)
                 inherited_criterion = previous_best["criterion"]
         return {"checkpoint": str(output / "last.pt"), "best_checkpoint": str(best), "history": history}
     finally:
+        for loader in (*loaders, *(replay or ())):
+            loader.dataset.close()
         if gatherer is not None:
             for source in gatherer.sources.values():
                 source.close()
