@@ -5,7 +5,7 @@ from datetime import timedelta
 
 import numpy as np
 
-from .specs import EPOCH, QuerySpec, TokenBlock, as_datetime
+from .specs import DEFAULT_MAX_TOKENS, EPOCH, QuerySpec, TokenBlock, as_datetime
 
 
 @dataclass
@@ -19,8 +19,8 @@ class MultiResolutionGatherer:
         self.registry, self.sources = registry, sources
         sampling = sampling or {}
         self.history_days = sampling.get("history_days", 90)
-        self.max_tokens = int(sampling.get("max_tokens", 4096))
-        self.spatial_selection = sampling.get("spatial_selection", "centers")
+        self.max_tokens = int(sampling.get("max_tokens", DEFAULT_MAX_TOKENS))
+        self.spatial_selection = sampling.get("spatial_selection", "intersects")
         if self.history_days <= 0 or self.max_tokens < 1:
             raise ValueError("history_days and max_tokens must be positive")
         if self.spatial_selection not in {"centers", "intersects"}:

@@ -8,6 +8,8 @@ import json
 import numpy as np
 
 EPOCH = datetime(1970, 1, 1)
+MAX_QUERY_WIDTH_DEGREES = 2.0
+DEFAULT_MAX_TOKENS = 5120
 
 
 def as_datetime(value):
@@ -22,7 +24,8 @@ def as_datetime(value):
 
 
 def normalize_longitude(value):
-    return (np.asarray(value) + 180.0) % 360.0 - 180.0
+    value = np.asarray(value)
+    return np.where((value >= -180) & (value < 180), value, (value + 180.0) % 360.0 - 180.0)
 
 
 def time_metadata(starts, ends):
@@ -50,8 +53,10 @@ class QuerySpec:
     def __post_init__(self):
         if not all(np.isfinite(v) for v in (self.lat, self.lon, self.delta_lat, self.delta_lon)):
             raise ValueError("Query coordinates and spatial widths must be finite")
-        if not -90 <= self.lat <= 90 or not 0 <= self.delta_lat <= 180 or not 0 <= self.delta_lon <= 360:
-            raise ValueError("Invalid latitude or spatial width")
+        if not -90 <= self.lat <= 90:
+            raise ValueError("Query latitude must be in [-90, 90] degrees")
+        if not all(0 <= width <= MAX_QUERY_WIDTH_DEGREES for width in (self.delta_lat, self.delta_lon)):
+            raise ValueError(f"Query full width must be between 0 and {MAX_QUERY_WIDTH_DEGREES:g} degrees on each axis")
         start, end = as_datetime(self.start_time), as_datetime(self.end_time)
         if end <= start:
             raise ValueError("Query requires start_time < end_time")

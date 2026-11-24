@@ -221,7 +221,9 @@ __marimo__/
 
 
 /ERA5_daily
+/data/
 /encoding/runs/
 /encoding/model_save/
+/moe/runs/
 .vscode/
 Drivers/

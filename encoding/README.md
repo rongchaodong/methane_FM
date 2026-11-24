@@ -12,9 +12,13 @@
 
 ## 如何选择原生格点
 
-`delta_lat` 和 `delta_lon` 分别是矩形的完整纬向与经向宽度，单位为度。两个轴按各自的宽度选取网格。点查询或宽度不超过原生间距的轴取覆盖查询中心的一个格点。覆盖外无观测时，该来源可以返回空。
+`delta_lat` 和 `delta_lon` 分别是矩形的完整纬向与经向宽度，单位为度。两轴均为零表示点查询，每个空间来源读取包含该点的一个原生像元。NetCDF 内部共享边界归入偏北、偏东的单元，北向上的 GeoTIFF 使用原生行列的半开区间。矩形两轴均为正，各自最多 2°，包含恰好 2° 的情况。超限在创建 Query 时直接报错。
 
-宽轴默认使用 `sampling.spatial_selection: centers`，选入半开区域内的格点中心。常规完整覆盖下，1° × 1° 对应 ERA5 的 16 个格点和 0.5° 地形网格的 4 个格点。0.5° × 1° 对应 8 个和 2 个。5 km 土壤格点数随纬度、投影和缺测情况变化。需要纳入边界切到的 NetCDF 网格时可改为 `intersects`。经度跨 ±180° 会回绕，纬度在两极截止，缺测按变量 mask 处理。超过 `max_tokens` 会提示缩小区域或时间窗口，或调高上限。
+默认 `sampling.spatial_selection: intersects` 选取与查询有正面积相交的每个原生像元，纯边界接触的交面积为零。NetCDF 优先使用文件的坐标 bounds。当前文件按相邻中心推导边界，经度回绕、纬度裁至两极。token 的矩形中心和宽度来自实际边界，包括极点处的半格。以 `(40.5, -93.5)` 为中心查询 1° × 1°，ERA5、0.5° 地形和 5 km 土壤分别相交 25、9 和 414 个像元。
+
+空间上限与 `sampling.max_tokens` 分别检查。产品默认预算为 5,120 个 tokens，覆盖上述位置 2° × 2° 的完整 2020 年 7 月窗口（4,103 个有效 tokens）。更长时间窗或更密的来源触及预算时会报错。
+
+第 4 epoch checkpoint 训练时使用 `centers`。重放原试验时可显式指定这一策略。用旧权重执行 `intersects` 推理时，矩形的输入像元与历史训练存在差异，此时需按当前规则重新评估验证指标。
 
 点查询限制每个源每个时刻的空间采样数。只要有多个日期或来源，Cross-Attention 仍可利用这些 tokens。查询覆盖宽度不代表新增空间观测，Area embedding 也没有面积加权或子区域一致性约束。
 
@@ -22,7 +26,7 @@
 
 默认配置读取 `ERA5_daily/processed/` 中的 TAIR、VAPR、PREC、SOLR、SM，保留现有物理单位和 0.25° 网格。地形和类别变量仍读取 `Drivers/` 的 0.5° NetCDF。
 
-`soil_5km` 读取 6 份 SoilGrids 0–5 cm GeoTIFF，保留原生 Interrupted Goode Homolosine 网格。Rasterio 将经纬度查询定位到 5,000 m 像元，按窗口读取原始整数值。点和双轴均小于单个像元的查询取包含中心点的像元，两轴均为正的较大区域按像元中心筛选。GeoTIFF 使用 `sampling.spatial_selection: centers`。YAML 中 GeoTIFF 的 `resolution` 使用米，NetCDF 使用度。土壤变量沿用文件单位和原有标准化初始值，缺测通过 mask 保留。[SoilGrids 单位表](https://docs.isric.org/globaldata/soilgrids/SoilGrids_faqs_01.html)
+`soil_5km` 读取 6 份 SoilGrids 0–5 cm GeoTIFF，保留原生 Interrupted Goode Homolosine 网格。矩形在日期线、赤道和投影分瓣处拆分，然后按原生 5,000 m 像元行求相交范围。跨分区的像元按原生行列去重。投影边缘像元的坐标与局部角宽根据其有效地理范围估算。YAML 中 GeoTIFF 的 `resolution` 使用米，NetCDF 使用度。土壤变量沿用文件单位和标准化初始值，缺测通过各变量的 mask 处理。[SoilGrids 单位表](https://docs.isric.org/globaldata/soilgrids/SoilGrids_faqs_01.html)
 
 每个 source 对应一套原生网格和时间频率。添加同网格变量时，在对应 `drivers` 增加文件路径和 `normalization: [mean, std]` 或 `categories`。多变量同文件时可用 `variable` 指定文件内变量名。不同网格或频率单列一个来源。配置中的标准化系数是与文件单位相符的初始尺度，正式实验可在训练时间段估计统计量。
 

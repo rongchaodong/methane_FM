@@ -42,8 +42,8 @@ registry:
         CO2_concentration: {path: Drivers/co2-1979-2025.txt, normalization: [390, 35]}
 sampling:
   history_days: 14
-  spatial_selection: centers
-  max_tokens: 4096
+  spatial_selection: intersects
+  max_tokens: 5120
 queries:
   start_time: "2018-01-01"
   end_time: "2021-01-01"

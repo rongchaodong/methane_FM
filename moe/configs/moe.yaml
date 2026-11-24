@@ -1,0 +1,116 @@
+# 从仓库根目录启动。默认配置需先核对数据来源、质量规则和增长阈值。
+encoder:
+  checkpoint: auto
+  expected_best_epoch: 4
+  best_metric: jepa_loss
+  spatial_selection: intersects
+  freeze: true
+  latent_dim: 128
+
+data:
+  simulation_dir: data/methane_data/simulations
+  observations_dir: data/methane_data/observations
+  embedding_mode: online
+  gather_mode: history
+  cache_path: null
+  validation_fraction: 0.2
+  simulation_spatial_block_degrees: 5
+  samples_per_simulation_source: {train: 12000, validation: 3000}
+  simulation_date_range: ['1980-01-01', '2021-01-01']
+  observation_date_range: ['1980-01-01', '2026-01-01']
+  adapters:
+    # 当前文件缺少单位，按来源文档核实后填写。
+    tem_emission: {input_unit: null}
+    tem_uptake: {}
+    memo_uptake: {}
+    fluxnet: {input_unit: nmol_ch4_m2_s, period: day, site_classes: [WET]}
+    chamber: {input_unit: null, period: day}
+
+moe:
+  initial_num_experts: 4
+  expert_hidden_dims: [128, 64]
+  shared_hidden_dims: [128, 64]
+  router_hidden_dims: []
+  activation: gelu
+  normalization: none
+  dropout: 0.0
+  routing_temperature: 1.0
+  signature_guided_routing: true
+  signature_weight: 0.1
+  signature_epsilon: 0.01
+  signature_anchor_count: 32
+  routing_type: dense
+  top_k: 2
+
+training:
+  common:
+    device: cuda
+    seed: 42
+    batch_size: 8
+    num_workers: 0
+    epochs: 10
+    learning_rate: 0.0003
+    weight_decay: 0.0001
+    optimizer: adamw
+    scheduler: plateau
+    mixed_precision: true
+    gradient_clip: 1.0
+    patience: 3
+    min_delta: 0.0
+    loss: huber
+    huber_delta: 1.0
+    balance_weight: 0.01
+    min_utilization: 0.05
+    sign_weight: 0.0
+    expert_weight: 0.0
+    physical_response_weight: 0.0
+    calibration_sources: []
+    anchor_count: 32
+    output_dir: moe/runs
+  pretrain:
+    sources: [TEM, MeMo]
+    source_weights: {TEM: 1.0, MeMo: 1.0}
+  finetune:
+    sources: [FLUXNET, Chamber]
+    source_weights: {FLUXNET: 1.0, Chamber: 1.0}
+    # 训练前可按独立站点或日期保留后续增长批次。
+    data: {}
+    fluxnet_target_type: emission
+    use_simulation_replay: true
+    replay_sources: [TEM, MeMo]
+    phases:
+      - {name: A, epochs: 5}
+      - name: B
+        epochs: 3
+        learning_rate: 0.0001
+        encoder_lr: 0.00001
+        unfreeze_patterns: ['final_projection.*']
+        replay_weight: 0.25
+        distillation_weight: 0.1
+  continual:
+    sources: [FLUXNET, Chamber]
+    source_weights: {FLUXNET: 1.0, Chamber: 1.0}
+    # 通过 observation_site_ids 或 observation_date_range 指定独立批次。
+    data: {}
+    candidate_training: true
+    function_preserving_split: true
+    validate_before_accept: true
+    max_experts: 32
+    candidate_epochs: 2
+    candidate_steps: 100
+    candidate_learning_rate: 0.0001
+    replay_sources: [TEM, MeMo]
+    replay_weight: 0.25
+    distillation_weight: 0.1
+    growth:
+      # 阈值应由实际验证集校准。保留 null 时只记录诊断。
+      distance_threshold: null
+      loss_threshold: null
+      min_samples: 32
+      persistence: 2
+      min_validation_samples: 32
+      min_replay_samples: 32
+      gain_threshold: 0.0
+      forgetting_weight: 1.0
+      parameter_weight: 0.0
+      max_forgetting: 0.0

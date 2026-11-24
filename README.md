@@ -26,7 +26,7 @@ python process_era5_daily.py            # 单位转换
 
 ## 环境表示学习（Environmental JEPA）
 
-[encoding/](encoding/README.md) 直接读取已处理的 ERA5 日数据、5 km SoilGrids GeoTIFF、0.5° 地形和类别 NetCDF，以及全球年度浓度。按 Query 范围选择原生网格，用同一 Encoder 生成点或矩形区域的 `[B,128]` 表示。JEPA 可同时预测日、月和不同空间范围的未来表示。
+[encoding/](encoding/README.md) 直接读取已处理的 ERA5 日数据、5 km SoilGrids GeoTIFF、0.5° 地形和类别 NetCDF，以及全球年度浓度。点查询读取所属原生像元，矩形查询读取所有与其有正面积相交的原生像元。矩形的纬向和经向完整宽度各自最多为 2°。同一 Encoder 生成 `[B,128]` 表示，JEPA 可同时预测日、月和不同空间范围的未来表示。
 
 ```bash
 conda activate fm
@@ -35,3 +35,7 @@ python -m encoding.train_environmental_jepa --config encoding/configs/environmen
 ```
 
 训练进度会写入运行目录的 `train.log`。空间选择、未来窗口配置、模型和恢复训练的入口见 [encoding 说明](encoding/README.md)。
+
+## 甲烷响应专家（Continual MoE）
+
+[moe/](moe/README.md) 复用环境 Encoder，在同一模型中预测自然排放与土壤吸收。训练流程包括 TEM / MeMo 预训练、FLUXNET / Chamber 微调，以及用新观测验证候选专家。数据字段、单位确认、各阶段启动和恢复命令见 [MoE 说明](moe/README.md)。目前已实现训练入口，真实数据训练由项目维护者启动。
