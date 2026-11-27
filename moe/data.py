@@ -17,9 +17,11 @@ from torch.utils.data import DataLoader, Dataset, Sampler
 from encoding.dataset import EnvironmentalCollator
 from encoding.specs import QuerySpec, as_datetime, normalize_longitude
 
+from .model import TARGET_TYPES as TASKS
+
 
 FLUX_UNIT = "mg_ch4_m2_day"
-TARGET_TYPES = {"emission": 0, "uptake": 1, "net": 2}
+TARGET_TYPES = {task: index for index, task in enumerate(TASKS)}
 MOLAR_MASS_CH4 = 16.0425
 MOLAR_MASS_C = 12.011
 ADAPTERS = {
@@ -42,7 +44,7 @@ ADAPTERS = {
         input_unit="mg_ch4_m2_month", sign=-1, month_origin="1990-01-01",
     ),
     "fluxnet": dict(
-        source="FLUXNET", period="day", path="FLUXNET-CH4/FLUXNET_T1_DD.csv",
+        source="FLUXNET", target_type="emission", period="day", path="FLUXNET-CH4/FLUXNET_T1_DD.csv",
         metadata_path="FLUXNET-CH4/FLUXNET_CH4_2024.csv", target_column="FCH4_F_ANNOPTLM",
         site_column="Site", time_column="TIMESTAMP", metadata_site_column="SITE_ID",
         latitude_column="LOCATION_LAT", longitude_column="LOCATION_LONG",
@@ -60,7 +62,6 @@ ADAPTERS = {
 }
 GRID_PRODUCTS = ("tem_emission", "tem_uptake", "memo_uptake")
 SPLITS = ("train", "validation", "testing")
-CACHE_PROVENANCE_KEYS = ("checkpoint_sha256", "query_version", "preprocessing_version", "sampling")
 DATA_QUERY_VERSION = "moe-native-grid-centers-v2"
 
 
@@ -599,25 +600,33 @@ def cache_query_key(query):
     ], separators=(",", ":"))
 
 
-def save_embedding_cache(path, entries, encoder_metadata, *, gather_mode="history", simulation_daily_start="1979-01-01"):
-    """Save supplied (QuerySpec, latent) pairs for use in cached mode."""
-    if gather_mode not in {"history", "query_window"}:
-        raise ValueError("Embedding cache gather_mode must be history or query_window.")
-    metadata = {key: encoder_metadata[key] for key in CACHE_PROVENANCE_KEYS}
-    metadata["gather_mode"] = gather_mode
-    metadata["data_query_version"] = DATA_QUERY_VERSION
-    metadata["simulation_daily_start"] = as_datetime(simulation_daily_start).isoformat()
-    rows = {cache_query_key(query): latent.detach().cpu().clone() for query, latent in entries}
-    torch.save({"metadata": metadata, "rows": rows}, path)
+def save_embedding_cache(path, entries, encoder_metadata, *, simulation=False, **options):
+    from .cache import save_embeddings
+
+    return save_embeddings(path, entries, encoder_metadata, simulation=simulation, **options)
 
 
 class MoECollator:
-    def __init__(self, *, gatherer=None, gather_mode="history", cache=None, latent_dim=128,
+    def __init__(self, *, gatherer=None, gather_mode="history", cache=None,
                  simulation_daily_start="1979-01-01"):
         self.gatherer, self.gather_mode = gatherer, gather_mode
-        self.cache, self.latent_dim = cache, latent_dim
+        self.cache = cache
         self.environmental_collator = EnvironmentalCollator(gatherer.registry) if gatherer else None
         self.simulation_daily_start = as_datetime(simulation_daily_start)
+
+    def gather_context(self, sample):
+        query = sample["query"]
+        window = ({"start_time": query.start_time, "end_time": query.end_time}
+                  if self.gather_mode == "query_window" else {})
+        if sample["product"] in GRID_PRODUCTS:
+            context = self.gatherer.gather(query, daily_start=self.simulation_daily_start, **window)
+            if not context.blocks:
+                raise ValueError(f"No environmental tokens for valid simulation label {query}.")
+            return context
+        context = self.gatherer.gather(query, **window)
+        if any(self.gatherer.registry.sources[block.source].frequency == "daily" for block in context.blocks):
+            return context
+        return None
 
     def __call__(self, samples):
         samples = [sample for sample in samples if sample["quality_mask"]]
@@ -625,31 +634,17 @@ class MoECollator:
             return None
         batch = {}
         if self.cache is not None:
-            latents = []
-            for sample in samples:
-                key = cache_query_key(sample["query"])
-                if key not in self.cache:
-                    raise KeyError(f"Missing cached embedding for query {key}.")
-                latent = self.cache[key]
-                if latent.shape != (self.latent_dim,) or not latent.is_floating_point() or not torch.isfinite(latent).all():
-                    raise ValueError(f"Invalid cached embedding for query {key}.")
-                latents.append(latent)
+            values = self.cache.read(samples)
+            latents = [value for value in values if value is not None]
+            samples = [sample for sample, value in zip(samples, values) if value is not None]
+            if not samples:
+                return None
             batch["latent"] = torch.stack(latents).float()
         else:
             kept, contexts = [], []
             for sample in samples:
-                query = sample["query"]
-                window = ({"start_time": query.start_time, "end_time": query.end_time}
-                          if self.gather_mode == "query_window" else {})
-                if sample["product"] in GRID_PRODUCTS:
-                    context = self.gatherer.gather(query, daily_start=self.simulation_daily_start, **window)
-                    if not context.blocks:
-                        raise ValueError(f"No environmental tokens for valid simulation label {query}.")
-                    contexts.append(context)
-                    kept.append(sample)
-                    continue
-                context = self.gatherer.gather(query, **window)
-                if any(self.gatherer.registry.sources[block.source].frequency == "daily" for block in context.blocks):
+                context = self.gather_context(sample)
+                if context is not None:
                     contexts.append(context)
                     kept.append(sample)
             if not contexts:
@@ -677,18 +672,9 @@ def _collator(config, gatherer, encoder_metadata):
         raise ValueError(
             "Online mode requires a JEPA gatherer, and cached mode requires cache_path and encoder provenance."
         )
-    cache = torch.load(config["cache_path"], map_location="cpu", weights_only=True)
-    metadata = cache["metadata"]
-    for key in CACHE_PROVENANCE_KEYS:
-        if key not in encoder_metadata or key not in metadata or metadata[key] != encoder_metadata[key]:
-            raise ValueError(f"Cached embedding provenance differs from the configured JEPA encoder: {key}.")
-    if metadata.get("gather_mode") != gather_mode:
-        raise ValueError("Cached embedding gather_mode differs from the configured JEPA query mode.")
-    if metadata.get("data_query_version") != DATA_QUERY_VERSION:
-        raise ValueError("Embedding cache predates the corrected grid geometry. Rebuild it using the current queries.")
-    if metadata.get("simulation_daily_start") != as_datetime(config.get("simulation_daily_start", "1979-01-01")).isoformat():
-        raise ValueError("Cached embedding daily driver coverage differs from the configured simulation context.")
-    return MoECollator(cache=cache["rows"], latent_dim=encoder_metadata["model_config"]["latent_dim"])
+    from .cache import EmbeddingCache
+
+    return MoECollator(cache=EmbeddingCache(config, encoder_metadata))
 
 
 def product_names(sources, *, grid=None):
@@ -707,6 +693,8 @@ def product_inputs(config, names):
     for product in names:
         defaults = ADAPTERS[product]
         options = {**defaults, **config.get("adapters", {}).get(product, {})}
+        if options["target_type"] != defaults["target_type"]:
+            raise ValueError(f"{product}: target_type is fixed to {defaults['target_type']}.")
         options["conversion"] = _conversion(options.get("input_unit"), product)
         if options["period"] not in {"day", "month"}:
             raise ValueError(f"{product}: period must be day or month.")
@@ -745,9 +733,6 @@ def product_inputs(config, names):
                 metadata_path = base / options["metadata_path"]
                 version.append(_file_metadata(metadata_path, hash_content=True))
                 options["metadata_path"] = str(metadata_path.resolve())
-                options["target_type"] = config.get("fluxnet_target_type", "emission")
-                if options["target_type"] not in {"emission", "net"}:
-                    raise ValueError("fluxnet_target_type must be emission or net.")
         products[product] = {
             "options": options, "files": version, "path": str(path.resolve()),
             "date_range": [day.isoformat() for day in days],
@@ -758,10 +743,6 @@ def product_inputs(config, names):
 def build_loaders(config, partitions, *, batch_size, num_workers=0, training_seed=42,
                   gatherer=None, encoder_metadata=None):
     """Build only training and validation loaders from frozen supervision records."""
-    if config.get("embedding_mode") == "cached" and any(
-        hasattr(segment, "shard_lengths") for segments, _ in partitions for segment in segments
-    ):
-        raise ValueError("Full simulation uses streamed online inputs; the in-memory cache is for small datasets.")
     collator = _collator(config, gatherer, encoder_metadata)
     loaders = []
     for index, (split, (segments, provenance)) in enumerate(zip(SPLITS[:2], partitions, strict=True)):

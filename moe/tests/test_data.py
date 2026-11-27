@@ -3,19 +3,22 @@ from copy import deepcopy
 from datetime import datetime
 from itertools import chain
 from pathlib import Path
+from types import SimpleNamespace
 
 from netCDF4 import Dataset
 import numpy as np
 import pytest
 import torch
 
-from encoding import DriverRegistry, MultiResolutionGatherer, build_data_sources
+from encoding import DriverRegistry, MultiResolutionGatherer, QuerySpec, build_data_sources
+from encoding.dataset import EnvironmentalCollator
 from encoding.training import load_config
 from moe import data
+from moe.cache import EmbeddingCache, build_embedding_cache
 from moe.checkpoint import load_checkpoint, restore_model
 from moe.model import ContinualMethaneMoE, MoELoss
 from moe.simulation import block_ids
-from moe.splits import _read_snapshot, loader_partitions, prepare_manifest, stage_manifests
+from moe.splits import _read_snapshot, loader_partitions, prepare_manifest, stage_manifests, training_label_statistics
 from moe import training
 from moe.training import run_training
 
@@ -170,13 +173,17 @@ def test_training_seed_and_replay_use_the_frozen_fitting_partitions(tmp_path, mo
     active, _, _, _ = stage_manifests(config["data"], ["Chamber"], "finetune", None, resume=False, replay_sources=[])
     past_data = {"active_manifest": active[0], "historical_manifests": []}
     checkpoint = tmp_path / "finetune.pt"
-    torch.save({"format_version": 1, "stage": "finetune", "progress": {"data_provenance": past_data}}, checkpoint)
+    torch.save({"format_version": 2, "stage": "finetune", "progress": {"data_provenance": past_data},
+                "effective_config": {"data": {"gather_mode": "history", "simulation_daily_start": "1979-01-01"}}},
+               checkpoint)
     _chamber(tmp_path / "future.csv", [("S", 1, 2021, 5, 10), ("S", 1, 2022, 4, 11),
                                        ("S", 1, 2023, 2, 200)])
     future = {**config["data"], "observation_cohort": "future",
               "adapters": {"chamber": {"path": "future.csv"}}}
-    different_seed["training"]["continual"] = {"sources": ["Chamber"], "replay_sources": ["Chamber"],
-                                                "data": future}
+    different_seed["training"]["continual"] = {
+        "sources": ["Chamber"], "growth_validation_sources": ["Chamber"], "data": future,
+        "replay": {"observation": {"weight": 0.25, "sources": ["Chamber"]}},
+    }
     summary = run_training(different_seed, "continual", checkpoint=checkpoint, prepare_data=True)
     assert summary["lineage_intersections"] == {
         "historical_train/replay_validation": 0, "historical_train/testing": 0,
@@ -307,18 +314,76 @@ def test_old_manifest_and_old_cache_are_rejected(tmp_path):
     old_manifest.write_text('{"format_version":1}')
     with pytest.raises(ValueError, match="Unsupported split manifest"):
         _read_snapshot(old_manifest)
-    metadata = {key: "old" for key in data.CACHE_PROVENANCE_KEYS}
+    metadata = {"weights_sha256": "old"}
     cache = tmp_path / "latents.pt"
     torch.save({"metadata": {**metadata, "gather_mode": "history"}, "rows": {}}, cache)
-    with pytest.raises(ValueError, match="predates the corrected grid geometry"):
+    with pytest.raises(ValueError, match="incompatible embedding cache"):
         data._collator({"embedding_mode": "cached", "cache_path": cache}, None, metadata)
+
+
+def test_label_statistics_use_training_only_and_merge_product_moments():
+    def grid(task, count, mean, std):
+        return {"task": task, "bitmap": {}, "splits": {
+            "train": {"stats": {"valid_labels": count, "distribution": {"mean": mean, "std": std}}},
+            "validation": {"stats": {"valid_labels": 10, "distribution": {"mean": 900, "std": 50}}},
+        }}
+
+    manifest = {"products": {"tem_emission": grid("emission", 100, 20.0, 10.0),
+                             "tem_uptake": grid("uptake", 2, -2.0, 1.0),
+                             "memo_uptake": grid("uptake", 1, -8.0, 0.0)}}
+    stats = training_label_statistics((None, manifest))
+    assert stats["emission"] == {"count": 100, "mean": 20.0, "std": 10.0}
+    assert stats["uptake"]["count"] == 3 and stats["uptake"]["mean"] == -4.0
+    assert stats["uptake"]["std"] == pytest.approx(np.std([-3.0, -1.0, -8.0]))
+
+
+def test_embedding_cache_resumes_after_committed_chunks(tmp_path, monkeypatch):
+    class Encoder(torch.nn.Module):
+        registry = DriverRegistry()
+        provenance = {"weights_sha256": "test", "query_version": "test", "preprocessing_version": "test",
+                      "sampling": {}, "drivers": {}, "model_config": {"latent_dim": 2}}
+
+        def make_gatherer(self):
+            return SimpleNamespace(registry=self.registry, sources={})
+
+        def forward(self, values):
+            seen.extend(values[:, 0].tolist())
+            return values
+
+    seen = []
+    encoder = Encoder()
+    rows = [{"query": QuerySpec(i, 10, "2020-01-01", "2020-01-02"), "product": "tem_emission"} for i in range(8)]
+    config = {"cache_path": tmp_path / "cache", "cache_dtype": "float16", "cache_chunk_rows": 2}
+    partitions = [([rows], {"split": "train"})]
+    monkeypatch.setattr(data.MoECollator, "gather_context", lambda _, row: row["query"])
+    monkeypatch.setattr(EnvironmentalCollator, "collate_contexts",
+                        lambda _, queries: torch.tensor([[q.lat, q.lon] for q in queries], dtype=torch.float32))
+    write = EmbeddingCache.write
+
+    def interrupt(cache, entries):
+        write(cache, entries)
+        if len(seen) == 4:
+            raise InterruptedError("stop after SQLite commit and before cursor publication")
+
+    monkeypatch.setattr(EmbeddingCache, "write", interrupt)
+    with pytest.raises(InterruptedError):
+        build_embedding_cache(config, partitions, encoder, torch.device("cpu"), batch_size=2)
+    monkeypatch.setattr(EmbeddingCache, "write", write)
+    result = build_embedding_cache(config, partitions, encoder, torch.device("cpu"), batch_size=2)
+    assert result["splits"]["train"]["batches"] == 4
+    assert seen == list(range(8))
+    cache = EmbeddingCache(config, encoder.provenance)
+    try:
+        expected = torch.tensor([[i, 10] for i in range(8)], dtype=torch.float32)
+        torch.testing.assert_close(torch.stack(cache.read(rows)), expected, atol=0, rtol=0)
+    finally:
+        cache.close()
 
 
 @pytest.mark.parametrize("interruption_split", ["train", "validation"])
 def test_pretraining_resumes_an_incomplete_data_pass(tmp_path, monkeypatch, interruption_split):
     class FrozenEncoder(torch.nn.Module):
         provenance = {}
-        adapted = trainable = False
 
         def accept_cached(self, latent):
             return latent
@@ -330,14 +395,17 @@ def test_pretraining_resumes_an_incomplete_data_pass(tmp_path, monkeypatch, inte
     snapshot = prepare_manifest(config, ["MeMo"], "pretrain")
     partitions = loader_partitions([snapshot])
     seen = []
-    cache = {}
+    entries = []
     for segments, _ in partitions:
         segment = segments[0]
         for index in range(len(segment)):
             query = segment[index]["query"]
-            cache[data.cache_query_key(query)] = torch.ones(4)
+            entries.append((query, torch.ones(4)))
         segment.close()
-    collate = data.MoECollator(cache=cache, latent_dim=4)
+    metadata = {"weights_sha256": "test", "query_version": "test", "preprocessing_version": "test",
+                "sampling": {}, "drivers": {}, "model_config": {"latent_dim": 4}}
+    cache = data.save_embedding_cache(tmp_path / "cache", entries, metadata, simulation=True)
+    collate = data._collator({"embedding_mode": "cached", "cache_path": cache}, None, metadata)
 
     def track(samples):
         seen.extend(data.cache_query_key(row["query"]) for row in samples)
@@ -345,7 +413,8 @@ def test_pretraining_resumes_an_incomplete_data_pass(tmp_path, monkeypatch, inte
 
     monkeypatch.setattr(data, "_collator", lambda *_: track)
     loaders = data.build_loaders({}, partitions, batch_size=2, training_seed=9)
-    options = {"training_seed": 9, "epochs": 1, "checkpoint_interval_steps": 1, "anchor_count": 2}
+    options = {"training_seed": 9, "epochs": 1, "batch_size": 2, "learning_rate": 0.001,
+               "checkpoint_interval_steps": 1, "anchor_count": 2}
     encoder, criterion = FrozenEncoder(), MoELoss()
     save = training.save_checkpoint
 
@@ -356,24 +425,36 @@ def test_pretraining_resumes_an_incomplete_data_pass(tmp_path, monkeypatch, inte
             raise InterruptedError("stop after a persisted batch")
 
     monkeypatch.setattr(training, "save_checkpoint", interrupt)
-    model = ContinualMethaneMoE(latent_dim=4, initial_num_experts=2, expert_hidden_dims=[4], shared_hidden_dims=[4])
+    model = ContinualMethaneMoE(latent_dim=4, initial_num_experts=2, expert_hidden_dims=[4],
+                                shared_hidden_dims=[4], dropout=0.2)
+    reference = deepcopy(model)
     output = tmp_path / "run"
     with pytest.raises(InterruptedError):
-        training._fit(model, encoder, criterion, loaders, None, {}, options, "pretrain", None, None, None,
+        training._fit(model, encoder, criterion, loaders, None, {}, options, "pretrain", None, None,
                       torch.device("cpu"), None, output, [], {})
     checkpoint = load_checkpoint(output / "last.pt")
     assert checkpoint["progress"]["data_scan"]["batches"] == 1
     monkeypatch.setattr(training, "save_checkpoint", save)
     train_history = []
+    resumed = restore_model(checkpoint)
     try:
-        training._fit(restore_model(checkpoint), encoder, criterion, loaders, None, {}, options, "pretrain", None,
+        training._fit(resumed, encoder, criterion, loaders, None, {}, options, "pretrain",
                       checkpoint, None, torch.device("cpu"), None, output, train_history, {})
+        assert len(seen) == len(set(seen)) == 12
+        training._fit(reference, encoder, criterion, loaders, None, {}, options, "pretrain", None, None,
+                      torch.device("cpu"), None, tmp_path / "reference", [], {})
+        actual = resumed.state_dict()
+        for name, value in reference.state_dict().items():
+            if isinstance(value, torch.Tensor):
+                assert torch.equal(actual[name], value)
+            else:
+                assert actual[name] == value
     finally:
         for loader in loaders:
             loader.dataset.close()
+        collate.cache.close()
     assert train_history[-1]["train"]["samples"] == 8
     assert train_history[-1]["validation"]["samples"] == 4
-    assert len(seen) == len(set(seen)) == 12
 
 
 @pytest.mark.parametrize(("product", "raw_lat", "raw_lon", "value"), [

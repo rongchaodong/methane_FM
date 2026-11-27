@@ -1,26 +1,43 @@
 import os
+import random
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
+import numpy as np
 import torch
 
+from .encoder import EMBEDDING_VERSION_KEYS, weights_fingerprint
 
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 
 
-def save_checkpoint(path, model, encoder, config, *, stage, phase=None, criterion=None,
+def rng_state(device=None):
+    kind, state, index, has_gauss, cached = np.random.get_state()
+    return {"python": random.getstate(), "numpy": (kind, state.tolist(), index, has_gauss, cached),
+            "torch": torch.get_rng_state(),
+            "cuda": torch.cuda.get_rng_state(device) if device is not None and device.type == "cuda" else None}
+
+
+def restore_rng(state, device):
+    random.setstate(state["python"])
+    kind, values, index, has_gauss, cached = state["numpy"]
+    np.random.set_state((kind, np.array(values, dtype=np.uint32), index, has_gauss, cached))
+    torch.set_rng_state(state["torch"].cpu())
+    if device.type == "cuda":
+        torch.cuda.set_rng_state(state["cuda"].cpu(), device)
+
+
+def save_checkpoint(path, model, encoder, effective_config, *, stage, criterion=None,
                     optimizer=None, scheduler=None, scaler=None, progress=None, growth=None, teacher=None):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "format_version": FORMAT_VERSION,
         "stage": stage,
-        "phase": phase,
-        "config": config,
+        "effective_config": effective_config,
         "model_config": model.metadata(),
         "model": model.state_dict(),
         "encoder_provenance": encoder.provenance,
-        "encoder_adapted": encoder.adapted or encoder.trainable,
         "encoder": encoder.state_dict(),
         "criterion": criterion.state_dict() if criterion is not None else None,
         "optimizer": optimizer.state_dict() if optimizer is not None else None,
@@ -29,8 +46,9 @@ def save_checkpoint(path, model, encoder, config, *, stage, phase=None, criterio
         "progress": progress or {},
         "growth": growth.state_dict() if hasattr(growth, "state_dict") else growth,
         "teacher": teacher,
+        "rng": rng_state(next(model.parameters()).device),
     }
-    # 同一目录原子替换，保留写入中断前的完整 checkpoint。
+    # Publish atomically on the same filesystem so an interrupted write leaves the previous checkpoint intact.
     with NamedTemporaryFile(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False) as stream:
         temp_path = Path(stream.name)
         try:
@@ -46,7 +64,8 @@ def save_checkpoint(path, model, encoder, config, *, stage, phase=None, criterio
 def load_checkpoint(path, map_location="cpu"):
     payload = torch.load(path, map_location=map_location, weights_only=True)
     if payload.get("format_version") != FORMAT_VERSION:
-        raise ValueError(f"Unsupported MoE checkpoint format: {path}")
+        raise ValueError(f"Incompatible MoE checkpoint: {path}. Start a new MoE run with the existing JEPA checkpoint "
+                         "and Task 1 split manifests. This format requires two normalized tasks and independent routers.")
     return payload
 
 
@@ -61,8 +80,8 @@ def restore_model(payload):
 def restore_encoder(encoder, payload):
     saved = payload["encoder_provenance"]
     if any(encoder.provenance.get(key) != saved.get(key)
-           for key in ("checkpoint_sha256", "query_version", "preprocessing_version", "sampling")):
+           for key in EMBEDDING_VERSION_KEYS):
         raise ValueError("JEPA encoder provenance does not match the MoE checkpoint")
-    encoder.load_state_dict(payload["encoder"], strict=True)
-    encoder.adapted = payload["encoder_adapted"]
-    return encoder
+    if weights_fingerprint(encoder.state_dict()) != weights_fingerprint(payload["encoder"]):
+        raise ValueError("MoE checkpoint encoder state differs from the frozen JEPA parameters or buffers")
+    return encoder.eval()

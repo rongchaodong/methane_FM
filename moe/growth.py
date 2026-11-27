@@ -19,7 +19,7 @@ class CandidateTrainer:
         self.enable_training_mode()
 
     def enable_training_mode(self):
-        # 冻结参数时也固定已存在分支的 dropout 行为。
+        # Keep dropout disabled in the frozen branches during candidate adaptation.
         self.model.eval()
         self.model.experts[self.index].train()
         self.model.router.branches[self.index].train()
@@ -74,14 +74,11 @@ class GrowthManager:
 
     @staticmethod
     def _response_loss(criterion, prediction, batch):
-        output = {"emission": prediction[:, 0], "uptake": prediction[:, 1], "net": prediction.sum(dim=-1)}
+        output = dict(zip(TARGET_TYPES, prediction.unbind(dim=1)))
         losses, weights = criterion.sample_losses(output, batch)
-        sources = criterion.sources(batch, len(losses))
-        return sum(
-            criterion.source_weights.get(source, 1.0)
-            * criterion.weighted_mean(losses, weights * criterion.source_mask(sources, source, losses.device))
-            for source in sorted(set(sources))
-        )
+        _, types, _, _ = supervision(batch, losses.device)
+        objectives, _ = criterion.grouped_risk(losses, weights, types, batch)
+        return sum(objectives)
 
     @torch.no_grad()
     def observe(self, model, output, batch, criterion):
@@ -105,7 +102,7 @@ class GrowthManager:
         known = model.signatures.initialized
         supported = known.sum(dim=-1, keepdim=True)
         mean_known = averages.sum(dim=-1, keepdim=True) / supported.clamp_min(1)
-        # 缺失的 Signature 使用同一任务已知距离的平均值；全缺失时距离项为零。
+        # Use the mean known distance for missing signatures within the same task.
         averages = torch.where(known, averages, mean_known)
         latent_scores = (averages * weights.sum(dim=0)[:, None]).sum(dim=0) / weights.sum()
         base = output["base"]
@@ -114,7 +111,7 @@ class GrowthManager:
             self._response_loss(criterion, base + residual, batch) for residual in residuals.unbind(dim=-1)
         ])
         scores = self.latent_weight * latent_scores + self.response_weight * response_scores
-        baseline = torch.stack([output[task] for task in TARGET_TYPES[:2]], dim=1)
+        baseline = torch.stack([output[task] for task in TARGET_TYPES], dim=1)
         old_loss = float(self._response_loss(criterion, baseline, batch))
         if not torch.isfinite(scores).all() or not math.isfinite(old_loss):
             raise ValueError("Non-finite values encountered during expert matching")

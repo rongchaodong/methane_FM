@@ -4,7 +4,6 @@ encoder:
   expected_best_epoch: 4
   best_metric: jepa_loss
   spatial_selection: intersects
-  freeze: true
   latent_dim: 128
 
 data:
@@ -13,6 +12,8 @@ data:
   embedding_mode: online
   gather_mode: history
   cache_path: null
+  cache_dtype: float32
+  cache_chunk_rows: 4096
   split_seed: 42
   split_manifest_dir: moe/runs/splits-v2
   simulation_mode: full
@@ -44,8 +45,6 @@ moe:
   signature_weight: 0.1
   signature_epsilon: 0.01
   signature_anchor_count: 32
-  routing_type: dense
-  top_k: 2
 
 training:
   common:
@@ -58,56 +57,54 @@ training:
     weight_decay: 0.0001
     optimizer: adamw
     scheduler: plateau
-    mixed_precision: true
+    mixed_precision: fp16
     gradient_clip: 1.0
     patience: 3
     min_delta: 0.0
-    loss: huber
+    loss: mse
     huber_delta: 1.0
-    balance_weight: 0.01
+    task_weights: {emission: 1.0, uptake: 1.0}
+    balance_weight: 0.0
     min_utilization: 0.05
     sign_weight: 0.0
     expert_weight: 0.0
     physical_response_weight: 0.0
     calibration_sources: []
     anchor_count: 32
+    temperature_schedule: {kind: fixed}
+    validation_weighting: sample_equal
+    checkpoint_interval_steps: 10000
+    log_interval_steps: 1000
+    gradient_diagnostic_interval_steps: 1000
+    task_gradient_cosine: false
+    distillation_weight: 0.0
+    replay:
+      simulation: {weight: 0.0, sources: [TEM, MeMo]}
+      observation: {weight: 0.0, sources: [FLUXNET, Chamber]}
     output_dir: moe/runs
   pretrain:
     sources: [TEM, MeMo]
     source_weights: {TEM: 1.0, MeMo: 1.0}
-    checkpoint_interval_steps: 10000
+    validation_interval_steps: 10000
+    validation_probe_batches_per_product: 16
   finetune:
     sources: [FLUXNET, Chamber]
     source_weights: {FLUXNET: 1.0, Chamber: 1.0}
     # Scope the initial observations before creating the manifest if reserving future data.
     data: {}
-    fluxnet_target_type: emission
-    use_simulation_replay: true
-    replay_sources: [TEM, MeMo]
-    phases:
-      - {name: A, epochs: 5}
-      - name: B
-        epochs: 3
-        learning_rate: 0.0001
-        encoder_lr: 0.00001
-        unfreeze_patterns: ['final_projection.*']
-        replay_weight: 0.25
-        distillation_weight: 0.1
+    epochs: 5
   continual:
     sources: [FLUXNET, Chamber]
     source_weights: {FLUXNET: 1.0, Chamber: 1.0}
     # Set a unique ID and select new observations using dates, sites, or updated input files.
     data: {observation_cohort: null}
+    scheduler: none
     candidate_training: true
-    function_preserving_split: true
-    validate_before_accept: true
     max_experts: 32
     candidate_epochs: 2
     candidate_steps: 100
     candidate_learning_rate: 0.0001
-    replay_sources: [TEM, MeMo]
-    replay_weight: 0.25
-    distillation_weight: 0.1
+    growth_validation_sources: [FLUXNET, Chamber]
     growth:
       # Use validation data to calibrate thresholds. Null enables monitoring only.
       distance_threshold: null

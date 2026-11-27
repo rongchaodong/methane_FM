@@ -3,7 +3,6 @@ encoder:
   checkpoint: auto
   expected_best_epoch: 4
   spatial_selection: intersects
-  freeze: true
 
 data:
   split_seed: 42

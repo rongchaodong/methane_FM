@@ -4,11 +4,35 @@ from copy import deepcopy
 import math
 
 import torch
-from torch import Tensor, nn
+from torch import nn
 from torch.nn import functional as F
 
 
-TARGET_TYPES = ("emission", "uptake", "net")
+TARGET_TYPES = ("emission", "uptake")
+
+
+class LabelNormalization(nn.Module):
+    def __init__(self, statistics=None):
+        super().__init__()
+        if statistics is None:
+            statistics = {task: {"mean": 0.0, "std": 1.0, "count": 0} for task in TARGET_TYPES}
+        for task in TARGET_TYPES:
+            row = statistics[task]
+            if not math.isfinite(row["mean"]) or not math.isfinite(row["std"]) or row["std"] <= 1e-8:
+                raise ValueError(f"Invalid {task} label normalization: expected finite mean and std > 1e-8")
+        self.statistics = deepcopy(statistics)
+        for key in ("mean", "std"):
+            self.register_buffer(key, torch.tensor([statistics[task][key] for task in TARGET_TYPES],
+                                                  dtype=torch.float32), persistent=False)
+            if not torch.isfinite(getattr(self, key)).all():
+                raise ValueError(f"Label normalization {key} cannot be represented in FP32")
+
+    def normalize(self, values, tasks):
+        return (values - self.mean[tasks]) / self.std[tasks]
+
+    def denormalize(self, values, tasks=None):
+        mean, std = (self.mean, self.std) if tasks is None else (self.mean[tasks], self.std[tasks])
+        return values * std + mean
 
 
 def _mlp(input_dim, hidden_dims, output_dim, activation, normalization, dropout):
@@ -57,14 +81,8 @@ class SignatureManager(nn.Module):
         divisor = torch.where(self.initialized, self.weight, 1)
         return (self.m2 / divisor[..., None]).clamp_min(0)
 
-    @torch.no_grad()
-    def reset_statistics(self):
-        self.weight.zero_()
-        self.mean.zero_()
-        self.m2.zero_()
-
     def distances(self, latent):
-        # Signature 的统计存储精度与 AMP 的前向精度分开，避免小方差触发溢出。
+        # Keep small variances and distances in FP32 under autocast.
         dtype = torch.promote_types(latent.dtype, self.mean.dtype)
         deviation = latent.to(dtype)[:, None, None, :] - self.mean
         distance = (deviation.square() / (self.variance + self.epsilon)).mean(dim=-1)
@@ -76,14 +94,14 @@ class SignatureManager(nn.Module):
         usable = torch.isfinite(latent).all(dim=-1)
         latent = latent.masked_fill(~usable[:, None], 0)
         weights = routing.detach().to(self.weight.dtype) * task_mask.to(self.weight.dtype)[..., None]
-        weights = weights.masked_fill(~usable[:, None, None], 0)
+        weights = weights.masked_fill(~usable[:, None, None] | (task_mask == 0)[..., None], 0)
         if expert_indices is not None:
             selected = torch.zeros_like(self.weight[0], dtype=torch.bool)
             selected[list(expert_indices)] = True
             weights = weights.masked_fill(~selected, 0)
         mass = weights.sum(dim=0)
         divisor = torch.where(mass > 0, mass, 1)
-        # 逐批合并加权中心矩，避免 E[z²] - E[z]² 的消减误差。
+        # Merge weighted central moments to avoid cancellation in E[z²] - E[z]².
         mean = torch.einsum("bqk,bd->qkd", weights, latent) / divisor[..., None]
         centered = latent[:, None, None, :] - mean
         m2 = (weights[..., None] * centered.square()).sum(dim=0)
@@ -96,7 +114,7 @@ class SignatureManager(nn.Module):
 
     @torch.no_grad()
     def split(self, parent):
-        # 均分父专家的历史权重，同时保留均值、方差和已初始化状态。
+        # Split mass while preserving the mean, variance, and initialized state.
         self.weight[:, parent].mul_(0.5)
         self.m2[:, parent].mul_(0.5)
         for name in ("weight", "mean", "m2", "fingerprint"):
@@ -150,53 +168,33 @@ class SignatureManager(nn.Module):
 
 
 class TaskSpecificRouter(nn.Module):
-    def __init__(self, latent_dim, num_experts, routing_type, top_k, temperature, **mlp_options):
+    def __init__(self, latent_dim, num_experts, temperature, **mlp_options):
         super().__init__()
-        if routing_type not in ("dense", "top_k", "top-k"):
-            raise ValueError(f"Unknown routing type: {routing_type}")
-        if temperature <= 0 or top_k <= 0:
-            raise ValueError("Router temperature and top_k must be positive")
-        self.routing_type = routing_type
-        self.top_k = top_k
-        self.temperature = temperature
-        self.family_count = num_experts
-        self.split_parents = []
-        self.branches = nn.ModuleList(_mlp(latent_dim, output_dim=2, **mlp_options)
-                                      for _ in range(num_experts))
-        self.register_buffer("family", torch.arange(num_experts))
+        self.branches = nn.ModuleList(nn.ModuleList(_mlp(latent_dim, output_dim=1, **mlp_options)
+                                                   for _ in TARGET_TYPES) for _ in range(num_experts))
         self.register_buffer("log_mass", torch.zeros(num_experts))
+        self.register_buffer("temperature", torch.ones(()))
+        self.set_temperature(temperature)
+
+    def set_temperature(self, temperature):
+        if not math.isfinite(temperature) or temperature <= 0:
+            raise ValueError("Router temperature must be finite and positive")
+        self.temperature.fill_(temperature)
 
     @torch.no_grad()
     def split(self, parent):
         self.branches.append(deepcopy(self.branches[parent]))
-        self.split_parents.append(parent)
-        # 在温度缩放后的分数上减去 log(2)，均分父分支概率质量。
+        # Apply the split in the post-temperature logit space to halve the parent's probability mass.
         self.log_mass[parent] -= math.log(2)
         self.log_mass = torch.cat((self.log_mass, self.log_mass[parent : parent + 1]))
-        self.family = torch.cat((self.family, self.family[parent : parent + 1]))
 
     def forward(self, latent, signature_penalty=None):
-        logits = torch.stack([branch(latent) for branch in self.branches], dim=-1)
+        logits = torch.stack([torch.cat([head(latent) for head in branch], dim=1)
+                              for branch in self.branches], dim=-1)
         logits = logits.to(torch.promote_types(logits.dtype, self.log_mass.dtype))
         if signature_penalty is not None:
             logits = logits - signature_penalty
-        scaled = logits / self.temperature
-        scores = scaled + self.log_mass
-        dense = scores.softmax(dim=-1)
-        if self.routing_type == "dense" or self.top_k >= self.family_count:
-            return dense, dense
-        # 按逆拆分顺序合并家族质量；相等的两个子分数合并后保持原值和 top-k 平局。
-        families = list(scaled.unbind(dim=-1))
-        for parent in reversed(self.split_parents):
-            child_score = families.pop()
-            parent_score = families[parent]
-            maximum = torch.maximum(parent_score, child_score)
-            relative_mass = ((parent_score - maximum).exp() + (child_score - maximum).exp()) * 0.5
-            families[parent] = maximum + relative_mass.log()
-        family_scores = torch.stack(families, dim=-1)
-        chosen = family_scores.topk(self.top_k, dim=-1).indices
-        active = chosen[..., None].eq(self.family).any(dim=-2)
-        return scores.masked_fill(~active, -torch.inf).softmax(dim=-1), dense
+        return (logits / self.temperature + self.log_mass).softmax(dim=-1)
 
 
 class ContinualMethaneMoE(nn.Module):
@@ -205,7 +203,7 @@ class ContinualMethaneMoE(nn.Module):
         shared_hidden_dims=(128, 64), router_hidden_dims=(), activation="gelu",
         normalization="none", dropout=0.0, routing_temperature=1.0,
         signature_guided_routing=True, signature_weight=0.1, signature_epsilon=0.01,
-        signature_anchor_count=64, routing_type="dense", top_k=2,
+        signature_anchor_count=64, label_normalization=None,
     ):
         super().__init__()
         if initial_num_experts < 1 or latent_dim < 1 or signature_epsilon <= 0 or signature_anchor_count < 0:
@@ -219,9 +217,9 @@ class ContinualMethaneMoE(nn.Module):
             "signature_weight": list(signature_weight) if isinstance(signature_weight, (tuple, list))
             else signature_weight,
             "signature_epsilon": signature_epsilon, "signature_anchor_count": signature_anchor_count,
-            "routing_type": routing_type, "top_k": top_k,
         }
         self.latent_dim = latent_dim
+        self.label_normalization = LabelNormalization(label_normalization)
         self.signature_guided_routing = signature_guided_routing
         signature_weight = torch.as_tensor(signature_weight, dtype=torch.float32)
         if signature_weight.numel() not in (1, 2) or (signature_weight < 0).any():
@@ -233,7 +231,7 @@ class ContinualMethaneMoE(nn.Module):
             _mlp(latent_dim, expert_hidden_dims, 2, **options) for _ in range(initial_num_experts)
         )
         self.router = TaskSpecificRouter(
-            latent_dim, initial_num_experts, routing_type, top_k, routing_temperature,
+            latent_dim, initial_num_experts, routing_temperature,
             hidden_dims=router_hidden_dims, **options,
         )
         self.signatures = SignatureManager(initial_num_experts, latent_dim, signature_anchor_count, signature_epsilon)
@@ -253,15 +251,21 @@ class ContinualMethaneMoE(nn.Module):
         penalty = None
         if self.signature_guided_routing:
             penalty = self.signatures.distances(latent) * self.signature_weight
-        routing, routing_dense = self.router(latent, penalty)
+        routing = self.router(latent, penalty)
         base = self.shared(latent)
         residuals = torch.stack([expert(latent) for expert in self.experts], dim=-1)
         prediction = base + (routing * residuals).sum(dim=-1)
         return {
-            "emission": prediction[:, 0], "uptake": prediction[:, 1], "net": prediction.sum(dim=-1),
+            "emission": prediction[:, 0], "uptake": prediction[:, 1],
             "routing": routing, "latent": latent, "expert_outputs": residuals,
-            "base": base, "routing_dense": routing_dense,
+            "base": base,
         }
+
+    @torch.no_grad()
+    def predict_physical(self, latent):
+        output = self(latent)
+        prediction = self.label_normalization.denormalize(torch.stack([output[task] for task in TARGET_TYPES], dim=-1))
+        return dict(zip(TARGET_TYPES, prediction.unbind(dim=-1)))
 
     @torch.no_grad()
     def refresh_fingerprints(self):
@@ -290,11 +294,12 @@ class ContinualMethaneMoE(nn.Module):
         return position
 
     def metadata(self):
-        return {"config": deepcopy(self.config), "experts": deepcopy(self.expert_records)}
+        return {"config": deepcopy(self.config), "experts": deepcopy(self.expert_records),
+                "label_normalization": deepcopy(self.label_normalization.statistics)}
 
     @classmethod
     def from_metadata(cls, metadata):
-        model = cls(**metadata["config"])
+        model = cls(**metadata["config"], label_normalization=metadata["label_normalization"])
         records = metadata["experts"]
         positions = {record["expert_id"]: index for index, record in enumerate(records[:model.num_experts])}
         for record in records[model.num_experts:]:
@@ -323,15 +328,15 @@ def supervision(batch, device=None):
 
 def task_mask(batch, device=None):
     _, types, weights, _ = supervision(batch, device=device)
-    # net 监督包含两个分量，两个任务共享该样本的 Signature 权重。
-    tasks = types[:, None].eq(torch.arange(2, device=types.device)) | types[:, None].eq(2)
+    tasks = types[:, None].eq(torch.arange(len(TARGET_TYPES), device=types.device))
     return tasks * weights[:, None]
 
 
 class MoELoss(nn.Module):
     def __init__(
-        self, kind="huber", huber_delta=1.0, source_weights=None, calibration_sources=(),
+        self, kind="mse", huber_delta=1.0, source_weights=None, task_weights=None, calibration_sources=(),
         balance_weight=0.0, sign_weight=0.0, expert_weight=0.0, min_utilization=0.05,
+        label_normalization=None,
     ):
         super().__init__()
         if kind not in ("huber", "mse") or huber_delta <= 0:
@@ -339,11 +344,18 @@ class MoELoss(nn.Module):
         self.kind = kind
         self.huber_delta = huber_delta
         self.source_weights = source_weights or {}
+        self.task_weights = {task: 1.0 for task in TARGET_TYPES} | (task_weights or {})
+        if self.task_weights.keys() != set(TARGET_TYPES) or any(
+            not math.isfinite(weight) or weight < 0
+            for weight in (*self.source_weights.values(), *self.task_weights.values())
+        ):
+            raise ValueError("Task and source weights must be finite and nonnegative, with only supported task names")
+        self.label_normalization = label_normalization if label_normalization is not None else LabelNormalization()
         self.balance_weight = balance_weight
         self.sign_weight = sign_weight
         self.expert_weight = expert_weight
         self.min_utilization = min_utilization
-        self.calibration = nn.ParameterDict({source: nn.Parameter(torch.zeros(2)) for source in calibration_sources})
+        self.calibration = nn.ParameterDict({source: nn.Parameter(torch.zeros(2, 2)) for source in calibration_sources})
 
     @staticmethod
     def sources(batch, size):
@@ -354,68 +366,87 @@ class MoELoss(nn.Module):
     def source_mask(sources, source, device):
         return torch.tensor([value == source for value in sources], dtype=torch.bool, device=device)
 
-    def predicted_target(self, output, batch, apply_calibration=True):
-        physical = torch.stack([output[name] for name in TARGET_TYPES], dim=1).float()
-        _, types, _, _ = supervision(batch, physical.device)
-        prediction = physical.gather(1, types.clamp(0, len(TARGET_TYPES) - 1)[:, None])
-        prediction = prediction[:, 0]
+    def predicted_target(self, output, batch, apply_calibration=True, types=None):
+        values = torch.stack([output[name] for name in TARGET_TYPES], dim=1).float()
+        if types is None:
+            _, types, _, _ = supervision(batch, values.device)
+        indices = types.clamp(0, len(TARGET_TYPES) - 1)
+        prediction = values.gather(1, indices[:, None])[:, 0]
         if apply_calibration and self.calibration:
-            sources = self.sources(batch, len(physical))
+            sources = self.sources(batch, len(values))
             for source, affine in self.calibration.items():
                 if source in sources:
-                    mask = self.source_mask(sources, source, physical.device)
-                    prediction = torch.where(mask, (1 + affine[0]) * prediction + affine[1], prediction)
+                    mask = self.source_mask(sources, source, values.device)
+                    scale, offset = affine[indices].unbind(dim=-1)
+                    prediction = torch.where(mask, (1 + scale) * prediction + offset, prediction)
         return prediction
 
-    metric_predictions = predicted_target
+    def normalized_error(self, output, batch, labels):
+        target, types, _, valid = labels
+        prediction = self.predicted_target(output, batch, types=types)
+        reference = self.label_normalization.normalize(target.float(), types.clamp(0, len(TARGET_TYPES) - 1))
+        return prediction.masked_fill(~valid, 0) - reference.masked_fill(~valid, 0)
 
     def sample_losses(self, output, batch):
-        prediction = self.predicted_target(output, batch)
-        target, _, weights, valid = supervision(batch, prediction.device)
-        error = prediction.masked_fill(~valid, 0) - target.masked_fill(~valid, 0).float()
+        labels = supervision(batch, output[TARGET_TYPES[0]].device)
+        return self.error_loss(self.normalized_error(output, batch, labels)), labels[2]
+
+    def error_loss(self, error):
         if self.kind == "mse":
-            return error.square(), weights
+            return error.square()
         absolute = error.abs()
         quadratic = absolute.clamp_max(self.huber_delta)
-        return 0.5 * quadratic.square() + self.huber_delta * (absolute - quadratic), weights
+        return 0.5 * quadratic.square() + self.huber_delta * (absolute - quadratic)
 
     @staticmethod
     def weighted_mean(values, weights):
         mass = weights.sum()
         return (values * weights).sum() / torch.where(mass > 0, mass, 1)
 
+    def grouped_risk(self, losses, weights, types, batch):
+        sources = self.sources(batch, len(weights))
+        masks = {source: self.source_mask(sources, source, weights.device) for source in dict.fromkeys(sources)}
+        by_source = {}
+        objectives = []
+        for index, task in enumerate(TARGET_TYPES):
+            task_mass = weights * (types == index)
+            risks = {source: self.weighted_mean(losses, task_mass * mask) for source, mask in masks.items()}
+            by_source[task] = risks
+            objectives.append(self.task_weights[task] * sum(self.source_weights.get(source, 1.0) * risk
+                                                             for source, risk in risks.items()))
+        return objectives, by_source
+
     def forward(self, output, batch):
-        losses, weights = self.sample_losses(output, batch)
-        _, types, _, _ = supervision(batch, losses.device)
-        sources = self.sources(batch, len(losses))
-        by_source = {
-            source: self.weighted_mean(losses, weights * self.source_mask(sources, source, losses.device))
-            for source in sorted(set(sources))
-        }
+        labels = supervision(batch, output[TARGET_TYPES[0]].device)
+        _, types, weights, _ = labels
+        losses = self.error_loss(self.normalized_error(output, batch, labels))
+        objectives, by_source = self.grouped_risk(losses, weights, types, batch)
         by_task = {
             name: self.weighted_mean(losses, weights * (types == index))
             for index, name in enumerate(TARGET_TYPES)
         }
-        data_loss = sum(self.source_weights.get(source, 1.0) * value for source, value in by_source.items())
-        effective = task_mask(batch, losses.device).float()
-        mass = effective.sum(dim=0)
-        present = mass > 0
-        divisor = torch.where(present, mass, 1)
-        routing = output["routing"].float()
-        dense = output.get("routing_dense", routing).float()
-        utilization = (routing * effective[..., None]).sum(dim=0) / divisor[:, None]
-        dense_utilization = (dense * effective[..., None]).sum(dim=0) / divisor[:, None]
-        entropy = -(routing * routing.clamp_min(1e-12).log()).sum(dim=-1)
-        entropy = (entropy * effective).sum(dim=0) / divisor
-        floor = min(self.min_utilization, 0.5 / routing.shape[-1])
-        balance = ((floor - dense_utilization).relu().square() * present[:, None]).mean()
-        sign = torch.stack(((-output["emission"]).relu(), output["uptake"].relu()), dim=-1)
-        sign_loss = self.weighted_mean(sign.square(), effective)
-        expert_loss = output["expert_outputs"].float().square().mean()
+        data_loss = sum(objectives)
+        zero = data_loss.new_zeros(())
+        balance = sign_loss = expert_loss = zero
+        if self.balance_weight or self.sign_weight or self.expert_weight:
+            effective = task_mask(batch, losses.device).float()
+            if self.balance_weight:
+                routing = output["routing"].float()
+                mass = effective.sum(dim=0)
+                utilization = (routing * effective[..., None]).sum(dim=0) / torch.where(mass > 0, mass, 1)[:, None]
+                floor = min(self.min_utilization, 0.5 / routing.shape[-1])
+                balance = ((floor - utilization).relu().square() * (mass > 0)[:, None]).mean()
+            if self.sign_weight:
+                prediction = torch.stack([output[task] for task in TARGET_TYPES], dim=-1).float()
+                physical = self.label_normalization.denormalize(prediction)
+                sign = torch.stack(((-physical[:, 0]).relu(), physical[:, 1].relu()), dim=-1)
+                sign_loss = self.weighted_mean((sign / self.label_normalization.std).square(), effective)
+            if self.expert_weight:
+                expert_loss = self.weighted_mean(output["expert_outputs"].float().square().mean(dim=-1), effective)
         loss = data_loss + self.balance_weight * balance + self.sign_weight * sign_loss + self.expert_weight * expert_loss
         return {
             "loss": loss, "data_loss": data_loss, "by_source": by_source, "by_task": by_task,
-            "utilization": utilization, "entropy": entropy, "balance_loss": balance, "sign_loss": sign_loss,
+            "task_objectives": objectives, "balance_loss": balance, "sign_loss": sign_loss,
             "expert_loss": expert_loss,
         }
 

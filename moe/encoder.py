@@ -1,12 +1,14 @@
 import hashlib
+import inspect
 import json
-from fnmatch import fnmatchcase
+import re
 from pathlib import Path
 
 import torch
 from torch import nn
 
 from encoding import DriverRegistry, EnvironmentalEncoder, MultiResolutionGatherer, build_data_sources
+from encoding.dataset import EnvironmentalCollator
 from encoding.specs import DEFAULT_MAX_TOKENS
 from encoding.training import load_config
 
@@ -15,6 +17,48 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 EXPORT_VERSION = "environmental-jepa-online-v1"
 QUERY_VERSION = "encoding-query-spec-v2"
 ONLINE_PREFIX = "online_encoder."
+EMBEDDING_VERSION_KEYS = ("weights_sha256", "query_version", "preprocessing_version", "sampling", "drivers")
+ENCODER_OPTIONS = {"checkpoint", "expected_best_epoch", "best_metric", "checkpoint_dir", "latent_dim",
+                   "jepa_config", "spatial_selection", "max_tokens"}
+
+
+def weights_fingerprint(state):
+    digest = hashlib.sha256()
+    for name, value in sorted(state.items()):
+        digest.update(json.dumps([name, str(value.dtype), list(value.shape)]).encode())
+        digest.update(value.detach().cpu().contiguous().reshape(-1).view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()
+
+
+def driver_inventory(registry, *, hash_small=True):
+    """Version the actual inputs, including in-place edits that preserve the modification time."""
+    inventory = {}
+    for driver in registry.drivers.values():
+        pattern = Path(re.sub(r"\{year[^}]*\}", "[0-9][0-9][0-9][0-9]", driver.path))
+        paths = (sorted(pattern.parent.glob(pattern.name)) if "{year" in driver.path else [pattern])
+        if not paths:
+            raise FileNotFoundError(f"No environmental driver files match {driver.path}")
+        files = []
+        for path in paths:
+            stat = path.stat()
+            version = {"path": str(path.resolve()), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns,
+                       "ctime_ns": stat.st_ctime_ns, "inode": stat.st_ino}
+            if hash_small and stat.st_size <= 16 * 1024**2:
+                version["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+            files.append(version)
+        inventory[driver.name] = files
+    return inventory
+
+
+def preprocessing_fingerprint(registry, model_config):
+    from .data import MoECollator
+
+    digest = hashlib.sha256(json.dumps([registry, model_config]).encode())
+    for name in ("specs.py", "sources.py", "projected.py", "gather.py", "model.py"):
+        digest.update((REPO_ROOT / "encoding" / name).read_bytes())
+    for function in (EnvironmentalCollator, MoECollator.gather_context):
+        digest.update(inspect.getsource(function).encode())
+    return digest.hexdigest()
 
 
 def _validation_record(checkpoint, metric):
@@ -60,52 +104,31 @@ class EnvironmentalEmbedding(nn.Module):
         self.encoder, self.sampling, self.provenance = encoder, sampling, provenance
         self.registry = encoder.registry
         self.latent_dim = encoder.latent_dim
-        self.adapted = False
-        self._patterns = ()
-        self.set_trainable(())
-
-    @property
-    def trainable(self):
-        return bool(self._patterns)
-
-    def set_trainable(self, patterns=()):
-        if isinstance(patterns, str):
-            patterns = (patterns,)
-        patterns = tuple(patterns)
-        names = [name for name, _ in self.encoder.named_parameters()]
-        missing = [pattern for pattern in patterns if not any(fnmatchcase(name, pattern) for name in names)]
-        if missing:
-            raise ValueError(f"JEPA unfreeze patterns match no parameter: {missing}")
-        for name, parameter in self.encoder.named_parameters():
-            parameter.requires_grad_(any(fnmatchcase(name, pattern) for pattern in patterns))
-        self._patterns = patterns
-        self.train(self.training)
+        self.encoder.requires_grad_(False)
+        self.eval()
 
     def train(self, mode=True):
-        super().train(mode)
-        # 局部解冻仅改变参数梯度。保持 JEPA dropout 关闭，使固定 anchors 可比较。
-        self.encoder.eval()
-        return self
+        return super().train(False)
 
     def make_gatherer(self):
         return MultiResolutionGatherer(self.registry, build_data_sources(self.registry), self.sampling)
 
     def forward(self, batch):
-        # Encoder 全冻结时仍允许对物理驱动求导。
-        if self.trainable or batch["values"].requires_grad:
+        # Physical response supervision differentiates with respect to raw drivers.
+        if batch["values"].requires_grad:
             return self.encoder(batch)
         with torch.no_grad():
             return self.encoder(batch)
 
     def accept_cached(self, latent):
-        if self.trainable or self.adapted:
-            raise ValueError("Cached embeddings require the frozen encoder from the original JEPA checkpoint")
         if latent.ndim != 2 or latent.shape[-1] != self.latent_dim:
             raise ValueError(f"Cached embeddings must have shape [B, {self.latent_dim}]")
         return latent.detach()
 
 
 def load_environmental_encoder(config, expected_provenance=None):
+    if unknown := config.keys() - ENCODER_OPTIONS:
+        raise ValueError(f"Unsupported encoder options: {sorted(unknown)}")
     path, expected, metric = _resolve_checkpoint(config)
     item = torch.load(path, map_location="cpu", weights_only=True)
     if "state_dict" in item and "registry" in item:
@@ -139,23 +162,19 @@ def load_environmental_encoder(config, expected_provenance=None):
     if selection != sampling.get("spatial_selection", "centers"):
         budget = DEFAULT_MAX_TOKENS
     sampling = {**sampling, "spatial_selection": selection, "max_tokens": config.get("max_tokens", budget)}
-    schema = json.dumps({"registry": registry, "sampling": sampling}, sort_keys=True).encode()
-    digest = hashlib.sha256(path.read_bytes()).hexdigest()
-    provenance = dict(checkpoint=str(path.resolve()), checkpoint_sha256=digest,
+    provenance = dict(checkpoint=str(path.resolve()), checkpoint_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+                      weights_sha256=weights_fingerprint(weights),
                       role="online_context", version=EXPORT_VERSION, epoch=epoch,
                       best_metric=metric, best_metric_value=best["validation"][metric] if best else None,
                       model_config=model_config, registry=registry, sampling=sampling,
-                      query_version=QUERY_VERSION,
-                      preprocessing_version=config.get("preprocessing_version") or hashlib.sha256(schema).hexdigest())
-    if expected_provenance and any(provenance[key] != expected_provenance.get(key)
-                                   for key in ("checkpoint_sha256", "role", "version", "query_version",
-                                               "preprocessing_version", "sampling")):
-        raise ValueError("JEPA checkpoint or preprocessing does not match the MoE checkpoint")
+                      query_version=QUERY_VERSION, preprocessing_version=preprocessing_fingerprint(registry, model_config),
+                      drivers=driver_inventory(DriverRegistry.from_dict(registry)))
+    if expected_provenance:
+        for key in EMBEDDING_VERSION_KEYS:
+            if provenance[key] != expected_provenance.get(key):
+                raise ValueError(f"JEPA embedding provenance differs from the MoE checkpoint: {key}")
     encoder = EnvironmentalEncoder(DriverRegistry.from_dict(registry), **model_config)
     if encoder.latent_dim != config.get("latent_dim", 128):
         raise ValueError("JEPA checkpoint latent dimension does not match encoder.latent_dim")
     encoder.load_state_dict(weights, strict=True)
-    result = EnvironmentalEmbedding(encoder, sampling, provenance)
-    if not config.get("freeze", True):
-        result.set_trainable(config["unfreeze_patterns"])
-    return result
+    return EnvironmentalEmbedding(encoder, sampling, provenance)

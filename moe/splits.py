@@ -4,6 +4,7 @@ from collections import Counter, defaultdict
 from hashlib import sha256
 from itertools import combinations
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -21,6 +22,7 @@ from .simulation import (
     FIT_SPLITS, SimulationSplit, block_ids as _block_ids, grid_input_stats,
     open_grid, prepare_full_simulation, verify_bitmap, year_partition,
 )
+from .model import TARGET_TYPES
 
 
 FORMAT_VERSION = 2
@@ -583,6 +585,38 @@ def loader_partitions(snapshots, names=None):
                 segments.append(segment)
         partitions.append((segments, provenance))
     return partitions
+
+
+def training_label_statistics(snapshot):
+    """Merge full-coverage, unweighted Training moments independently by task."""
+    moments = {}
+    for product in snapshot[1]["products"].values():
+        partition = product["splits"]["train"]
+        count = partition["stats"]["valid_labels"]
+        if not count:
+            continue
+        if "bitmap" in product:
+            # The full-grid index already scanned every selected label in bounded tiles.
+            distribution = partition["stats"]["distribution"]
+            mean, variance = distribution["mean"], distribution["std"] ** 2
+        else:
+            # Frozen observation and debug manifests contain the Training values directly.
+            mean, variance = 0.0, 0.0
+            for index, row in enumerate(partition["members"], 1):
+                delta = row["target"] - mean
+                mean += delta / index
+                variance += delta * (row["target"] - mean)
+            variance /= count
+        task = product["task"]
+        previous_count, previous_mean, previous_m2 = moments.get(task, (0, 0.0, 0.0))
+        total = previous_count + count
+        delta = mean - previous_mean
+        moments[task] = (total, previous_mean + delta * count / total,
+                         previous_m2 + variance * count + delta**2 * previous_count * count / total)
+    if missing := set(TARGET_TYPES) - moments.keys():
+        raise ValueError(f"Label normalization requires valid Training labels for: {sorted(missing)}")
+    return {task: {"count": count, "mean": mean, "std": math.sqrt(m2 / count)}
+            for task, (count, mean, m2) in moments.items()}
 
 
 def audit_summary(snapshot, checks, batch_size=8):
